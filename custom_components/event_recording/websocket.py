@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
 from datetime import timedelta
 from typing import Any
 
@@ -53,6 +55,25 @@ def make_event_cursor(event: RecordedEvent) -> str:
     return f"{format_iso(event.start_at)}|{event.event_id}"
 
 
+def _validate_annotation_exclusion(value: Any) -> dict[str, Any]:
+    """Validate a generic top-level annotation field equality filter."""
+    if not isinstance(value, dict) or set(value) != {"namespace", "field", "equals"}:
+        raise vol.Invalid("Expected namespace, field, and equals")
+
+    namespace = value["namespace"]
+    field = value["field"]
+    expected = value["equals"]
+    if not isinstance(namespace, str) or not namespace.strip() or len(namespace) > 128:
+        raise vol.Invalid("namespace must be a non-empty string of at most 128 characters")
+    if not isinstance(field, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", field):
+        raise vol.Invalid("field must be a top-level identifier of at most 64 characters")
+    if expected is not None and type(expected) not in (bool, str, int, float):
+        raise vol.Invalid("equals must be a JSON scalar")
+    if type(expected) is float and not math.isfinite(expected):
+        raise vol.Invalid("equals must be finite")
+    return value
+
+
 @callback
 def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register Event Recording WebSocket commands."""
@@ -71,6 +92,8 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_EVENTS,
         vol.Optional("source_id"): str,
         vol.Optional("kind"): str,
+        vol.Optional("exclude_current_complete_annotation"): _validate_annotation_exclusion,
+        vol.Optional("exclude_journal_only"): bool,
         vol.Optional("limit", default=50): vol.All(vol.Coerce(int), vol.Range(min=1, max=100)),
         vol.Optional("before_cursor"): str,
         vol.Optional("cursor"): str,
@@ -106,6 +129,12 @@ async def ws_handle_events(
         filters["source_id"] = msg["source_id"]
     if "kind" in msg:
         filters["kind"] = msg["kind"]
+    if "exclude_current_complete_annotation" in msg:
+        filters["exclude_current_complete_annotation"] = msg[
+            "exclude_current_complete_annotation"
+        ]
+    if msg.get("exclude_journal_only") is True:
+        filters["exclude_journal_only"] = True
 
     authorized_events: list[RecordedEvent] = []
     current_cursor = cursor

@@ -174,7 +174,13 @@ List events with keyset pagination and server-side security filtering. Cursor st
   "source_id": "binary_sensor.front_door_contact",
   "kind": "contact_open",
   "limit": 20,
-  "before_cursor": "..."
+  "before_cursor": "...",
+  "exclude_current_complete_annotation": {
+    "namespace": "event_vision",
+    "field": "activity",
+    "equals": false
+  },
+  "exclude_journal_only": true
 }
 
 // Response
@@ -229,6 +235,8 @@ List events with keyset pagination and server-side security filtering. Cursor st
   }
 }
 ```
+
+Both exclusion fields are optional. The annotation filter matches a top-level JSON scalar in a complete annotation for the current media revision. Namespace and field are caller supplied; booleans remain distinct from numbers, integer and real numbers compare numerically, and a missing field does not match JSON `null`. `exclude_journal_only` hides ready/expired events with no media and no capture error. Both filters apply before the page limit; the cursor advances through matching events.
 
 ### `event_recording/event`
 Get a single event by ID.

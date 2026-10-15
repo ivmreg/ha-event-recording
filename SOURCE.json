@@ -1,12 +1,12 @@
 {
   "source_repository": "https://github.com/ivmreg/ha-event-vision",
-  "source_commit": "9db5d4ad57274a990bbe781f02f47cbb4dbc79d7",
+  "source_commit": "7e3e7777d26128801f0eef5f7c4e0118481b6632",
   "source_dirty": false,
   "domain": "event_recording",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "files": {
     "LICENSE": "bbc18a253c048d1a0ea03f4fbe8df1b8b22cb1c80a90093673f643707da3fb5b",
-    "README.md": "f22d69501750e48bac5f177f1e6a3dc46c6475493689872d01c71c525c489175",
+    "README.md": "09c70358227bd1596b27e32709f311477fb98e48ad5f48f2eeaa7eb44fe1a969",
     "custom_components/event_recording/__init__.py": "2590dfbb07db29fcdd930785afcaa78b076ede5ec05cbb0422d326174819e00d",
     "custom_components/event_recording/api.py": "cb63fc4f1efb43d17e04a7810446b76c172b034955bb93afba3982481c8ebb2d",
     "custom_components/event_recording/camera_profiles.py": "3a73712771b3cb39b93d3c16073a1541f73cd1e4cab5d1198019eb518887c84f",
@@ -16,9 +16,9 @@
     "custom_components/event_recording/core/__init__.py": "91055cdda216158c448f03e3febad1a381dd4426e244ae2fa7c8007a0416290a",
     "custom_components/event_recording/core/media.py": "8dc1f96d328808d62db50d906cbc5fd7f65e67a4cf916e60568be6ef9193b86a",
     "custom_components/event_recording/core/models.py": "ba585698017876cb4b028b4bedf5f5524cbd3b030b589a51e78fd51148582b47",
-    "custom_components/event_recording/core/store.py": "01669c9328182565be2441fdf320b4bfa19edd203da694f6e7bb60986fd8d5df",
-    "custom_components/event_recording/frontend/event-card.js": "7a364900e0a86d818763138da88aa67329d64fbc3b0cc767d0469004099d5d9e",
-    "custom_components/event_recording/manifest.json": "e6435139f94d6f97ddfc89971f3e576c1b9d0c2af542d790645cfe1198f3921e",
+    "custom_components/event_recording/core/store.py": "6d98dfbc5671f326fb24579678d67556d6891578dc8e04187927541b396f704d",
+    "custom_components/event_recording/frontend/event-card.js": "41a7abca9140d3774d1f1c7f5c5573c354012af9b29f7903467b36e296602cc3",
+    "custom_components/event_recording/manifest.json": "64eb48540fc7d560686b679270b7b378080b528f2a88f23d5b1b78a388468c6f",
     "custom_components/event_recording/media.py": "fe391278b8094f24a0e487251d9f98586e00f58dba71d29ad651b53dfe75186a",
     "custom_components/event_recording/recorder.py": "19b8d21baeb0ed78e7c249b3c072169c43246c0608f162a6c1f4398fdad3669b",
     "custom_components/event_recording/services.py": "ee77f20cd7fc1f1d90675a9a54bfe9f32b94bfea203a77b2cf1f51d211b38c0c",
@@ -26,10 +26,10 @@
     "custom_components/event_recording/strings.json": "256af6c59068f89f367e13a413464de57eb4b844ea255768d92fd51b248392b2",
     "custom_components/event_recording/thumbnails.py": "83b4deb281c8fe15ed63e4614d2b17e24ee9f7f821f7c71d0b9f50ddcec7fad2",
     "custom_components/event_recording/translations/en.json": "256af6c59068f89f367e13a413464de57eb4b844ea255768d92fd51b248392b2",
-    "custom_components/event_recording/websocket.py": "7e09c4ce95b1c4aade9de22bd37726e90322d33548b1ac57521c33aeb97ba69c",
+    "custom_components/event_recording/websocket.py": "ae5786bd6a5414464115470f22c239c0def7143face2a1ae7d98fc134fdbd1e2",
     "docs/hacs.md": "edc3784eeeacab1953ff97523792bd475ac3e607092f4fe6a0c93d846d5f82bc",
     "docs/install.md": "01128b9e2a5adc237d647a3579397ba07724fca10eeaeef7f5e4c40b01f70013",
-    "docs/recording-ha-api.md": "83f8ddbbbc06e1f850ee7ea4f8ba5fe7429c160f1ff3c69b14cbcdb874127f3e",
+    "docs/recording-ha-api.md": "cb257513d07990fb749730bb24b2621454d6261a875931f20f898c000c7c995d",
     "hacs.json": "d8119e39ce3303de48df9bd3c9683f23a888e624a4b47435f42a7086e6a97f74"
   }
 }

@@ -534,6 +534,56 @@ class JournalStore:
                 clauses.append("start_at <= ?")
                 params.append(format_iso(ensure_utc(filters["start_before"])))
 
+            annotation_exclusion = filters.get("exclude_current_complete_annotation")
+            if annotation_exclusion is not None:
+                namespace = annotation_exclusion["namespace"]
+                field_path = f'$.{annotation_exclusion["field"]}'
+                encoded_value = json.dumps(annotation_exclusion["equals"], allow_nan=False)
+                clauses.append(
+                    """
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM annotations AS a
+                        WHERE a.event_id = events.event_id
+                          AND a.namespace = ?
+                          AND a.status = 'complete'
+                          AND a.expected_media_revision = events.media_revision
+                          AND (
+                              json_type(a.payload_json, ?) = json_type(?, '$')
+                              OR (
+                                  json_type(a.payload_json, ?) IN ('integer', 'real')
+                                  AND json_type(?, '$') IN ('integer', 'real')
+                              )
+                          )
+                          AND json_extract(a.payload_json, ?) IS json_extract(?, '$')
+                    )
+                    """
+                )
+                params.extend(
+                    [
+                        namespace,
+                        field_path,
+                        encoded_value,
+                        field_path,
+                        encoded_value,
+                        field_path,
+                        encoded_value,
+                    ]
+                )
+
+            if filters.get("exclude_journal_only") is True:
+                clauses.append(
+                    """
+                    NOT (
+                        capture_state IN ('ready', 'expired')
+                        AND COALESCE(capture_error, '') = ''
+                        AND NOT EXISTS (
+                            SELECT 1 FROM media AS m WHERE m.event_id = events.event_id
+                        )
+                    )
+                    """
+                )
+
             if cursor:
                 try:
                     c_start, c_id = cursor.split("|", 1)
