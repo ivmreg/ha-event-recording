@@ -26,16 +26,104 @@
     "step": {
       "init": {
         "title": "Event Recording Options",
-        "description": "Update retention budgets and recording chunk parameters.",
+        "description": "Manage storage settings and optional camera recording defaults.",
+        "menu_options": {
+          "recording_settings": "Storage and recording settings",
+          "cameras": "Camera profiles"
+        }
+      },
+      "recording_settings": {
+        "title": "Storage and Recording Settings",
+        "description": "Update global retention budgets and chunk parameters.",
         "data": {
           "retention_size_mb": "Maximum Storage Budget (MB)",
           "retention_days": "Retention Duration (Days)",
           "chunk_seconds": "Recording Chunk Duration (Seconds, max 15)"
         }
+      },
+      "cameras": {
+        "title": "Camera Profiles",
+        "description": "Camera profiles are optional defaults. Automations choose when to create journal events and record cameras.",
+        "menu_options": {
+          "camera_add": "Add a camera profile",
+          "camera_edit": "Edit a camera profile",
+          "camera_remove": "Remove a camera profile"
+        }
+      },
+      "camera_add": {
+        "title": "Add Camera Profile",
+        "description": "Choose a configured Home Assistant camera. Credentials remain managed by its camera integration.",
+        "data": {"camera_entity": "Camera"}
+      },
+      "camera_add_profile": {
+        "title": "Set Camera Defaults",
+        "description": "Set defaults for {camera_name}. Lookback needs stream preload or buffering enabled in the camera integration.",
+        "data": {
+          "source_id": "Source ID",
+          "label": "Display Name",
+          "window_seconds": "Default Recording Window (seconds)",
+          "lookback_seconds": "Lookback (seconds)",
+          "chunk_seconds": "Recording Chunk Duration (seconds)",
+          "max_window_seconds": "Maximum Recording Window (seconds)"
+        },
+        "data_description": {
+          "source_id": "Stable identifier used to group this camera's events in the timeline.",
+          "window_seconds": "The default duration requested when an automation records this camera.",
+          "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments.",
+          "max_window_seconds": "Longest recording window allowed for this camera."
+        }
+      },
+      "camera_edit": {
+        "title": "Choose Camera Profile to Edit",
+        "data": {"camera_entity": "Camera Profile"}
+      },
+      "camera_edit_profile": {
+        "title": "Edit Camera Profile",
+        "description": "Lookback needs stream preload or buffering enabled in the camera integration.",
+        "data": {
+          "camera_entity": "Camera",
+          "source_id": "Source ID",
+          "label": "Display Name",
+          "window_seconds": "Default Recording Window (seconds)",
+          "lookback_seconds": "Lookback (seconds)",
+          "chunk_seconds": "Recording Chunk Duration (seconds)",
+          "max_window_seconds": "Maximum Recording Window (seconds)"
+        },
+        "data_description": {
+          "source_id": "Stable identifier used to group this camera's events in the timeline.",
+          "window_seconds": "The default duration requested when an automation records this camera.",
+          "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments.",
+          "max_window_seconds": "Longest recording window allowed for this camera."
+        }
+      },
+      "camera_remove": {
+        "title": "Choose Camera Profile to Remove",
+        "data": {"camera_entity": "Camera Profile"}
+      },
+      "camera_remove_confirm": {
+        "title": "Remove Camera Profile",
+        "description": "Remove the profile for {camera_name} ({camera_entity})? Existing journal events and recordings will be kept.",
+        "data": {"confirm": "Remove this camera profile"}
       }
     },
     "error": {
-      "invalid_chunk_seconds": "Chunk duration must be between 1 and 15 seconds."
+      "invalid_camera_entity": "Choose a Home Assistant camera entity.",
+      "camera_entity_not_found": "Choose a camera entity that exists in Home Assistant.",
+      "camera_profile_exists": "A profile already exists for this camera.",
+      "camera_profile_missing": "That camera profile no longer exists. Open Camera Profiles and try again.",
+      "no_camera_profiles": "There are no camera profiles to edit or remove.",
+      "invalid_source_id": "Enter a source ID of 1 to 128 characters.",
+      "invalid_label": "Enter a display name of 1 to 256 characters.",
+      "invalid_window_seconds": "Recording window must be a whole number from 1 to 300 seconds.",
+      "invalid_lookback_seconds": "Lookback must be a whole number from 0 to 60 seconds.",
+      "invalid_chunk_seconds": "Chunk duration must be a whole number from 1 to 15 seconds.",
+      "invalid_max_window_seconds": "Maximum window must be a whole number from 1 to 300 seconds.",
+      "max_window_below_window": "Maximum recording window must be at least the default recording window."
+    },
+    "abort": {
+      "remove_cancelled": "Camera profile removal was cancelled.",
+      "camera_profile_missing": "That camera profile no longer exists.",
+      "no_camera_profiles": "There are no camera profiles to edit or remove."
     }
   }
 }

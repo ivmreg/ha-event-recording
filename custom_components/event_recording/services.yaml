@@ -56,7 +56,7 @@ record:
     source_id:
       name: Source ID
       description: Identifier of the triggering source or automation.
-      required: true
+      required: false
       example: binary_sensor.front_door_contact
       selector:
         text: {}
@@ -70,10 +70,17 @@ record:
     resource_key:
       name: Resource Key
       description: Canonical stream serialization key (e.g. camera entity ID).
-      required: true
+      required: false
       example: camera.front_door
       selector:
         text: {}
+    camera_entity:
+      name: Configured Camera
+      description: Use a configured camera profile to fill omitted recording defaults.
+      required: false
+      selector:
+        entity:
+          domain: camera
     operation:
       name: Operation
       description: Whether to start/extend an active episode or schedule closure.
@@ -86,8 +93,7 @@ record:
     window_seconds:
       name: Window Seconds
       description: Desired duration in seconds for this capture segment or tail (1-300).
-      required: true
-      default: 15
+      required: false
       selector:
         number:
           min: 1
@@ -108,7 +114,6 @@ record:
       name: Lookback Seconds
       description: Seconds of pre-event buffer to capture (0-60).
       required: false
-      default: 0
       selector:
         number:
           min: 0

@@ -105,7 +105,66 @@ class RecordingCoordinator:
 
     async def admit_record_intent(self, **kwargs: Any) -> Any:
         """Commit intake atomically with the short capture-finalization decision."""
+        profile_defaults = kwargs.pop("_profile_defaults", None)
+        explicit_fields = kwargs.pop("_explicit_fields", frozenset(kwargs))
+        explicit_recorder_config = kwargs.pop(
+            "_explicit_recorder_config", kwargs.get("recorder_config")
+        )
         async with self.admission_lock:
+            session = await self.store.get_resource_session(kwargs["resource_key"])
+            active = bool(session and session.active_event_id)
+            pinned: dict[str, Any] = {}
+            if active:
+                active_event = await self.store.get_event(session.active_event_id)
+                active = bool(active_event and active_event.capture_state in ("requested", "recording"))
+                pinned = dict((session.recorder_config or {}).get("_event_recording_profile") or {})
+
+            profile_values = ("source_id", "label", "window_seconds", "lookback_seconds")
+            if active:
+                for field in profile_values:
+                    if field not in explicit_fields and field in pinned:
+                        kwargs[field] = pinned[field]
+                if not pinned:
+                    # Legacy durable sessions have no profile snapshot. Preserve their
+                    # event metadata and current end time when a new caller omits values.
+                    if "source_id" not in explicit_fields:
+                        kwargs["source_id"] = active_event.source_id
+                    if "label" not in explicit_fields:
+                        kwargs["label"] = active_event.label
+                    if "window_seconds" not in explicit_fields:
+                        kwargs["window_seconds"] = max(
+                            1.0, (active_event.desired_capture_end - utc_now()).total_seconds()
+                        )
+                    if "lookback_seconds" not in explicit_fields:
+                        kwargs["lookback_seconds"] = 0.0
+
+                # Profile edits do not replace the active session's capture settings.
+                merged_config = dict(session.recorder_config or {})
+                for key, value in (explicit_recorder_config or {}).items():
+                    merged_config[key] = value
+                is_camera = (
+                    merged_config.get("adapter") == "camera"
+                    or "camera_entity" in merged_config
+                    or kwargs["resource_key"].startswith("camera.")
+                )
+                if is_camera:
+                    merged_config["adapter"] = "camera"
+                    merged_config["camera_entity"] = kwargs["resource_key"]
+                kwargs["recorder_config"] = merged_config
+            elif profile_defaults is not None:
+                chunk = float(profile_defaults.get("chunk_seconds", self.chunk_seconds))
+                maximum = float(profile_defaults.get("max_window_seconds", self.max_window_seconds))
+                snapshot = {
+                    "source_id": kwargs["source_id"],
+                    "label": kwargs.get("label"),
+                    "window_seconds": kwargs["window_seconds"],
+                    "lookback_seconds": kwargs.get("lookback_seconds", 0.0),
+                    "chunk_seconds": min(15.0, max(1.0, chunk)),
+                    "max_window_seconds": min(300.0, max(1.0, maximum)),
+                }
+                config = dict(kwargs.get("recorder_config") or {})
+                config["_event_recording_profile"] = snapshot
+                kwargs["recorder_config"] = config
             result = await self.store.admit_record_intent(**kwargs)
         self.notify_new_intent()
         return result
@@ -275,6 +334,8 @@ class RecordingCoordinator:
                     return
 
                 event_id = session.active_event_id
+                session_config = dict(session.recorder_config or {})
+                profile_snapshot = dict(session_config.get("_event_recording_profile") or {})
                 event: RecordedEvent | None = await self.store.get_event(event_id)
                 if not event:
                     return
@@ -282,7 +343,15 @@ class RecordingCoordinator:
 
                 # Calculate deadline from actual capture start to preserve occurred_at chronology for delayed sources
                 capture_start = utc_now()
-                max_end_time = capture_start + timedelta(seconds=self.max_window_seconds)
+                max_window_seconds = min(
+                    300.0,
+                    max(1.0, float(profile_snapshot.get("max_window_seconds", self.max_window_seconds))),
+                )
+                chunk_seconds = min(
+                    15.0,
+                    max(1.0, float(profile_snapshot.get("chunk_seconds", self.chunk_seconds))),
+                )
+                max_end_time = capture_start + timedelta(seconds=max_window_seconds)
 
                 if event.capture_state == "requested":
                     await self.store.update_capture_state(event_id, "recording")
@@ -296,6 +365,10 @@ class RecordingCoordinator:
                         if now >= max_end_time or (
                             now >= session.desired_capture_end and not session.hold
                         ):
+                            await self._finish_capture(event_id, valid_clips_count, last_error)
+                            return
+                        max_remaining = (max_end_time - now).total_seconds()
+                        if max_remaining < 1.0:
                             await self._finish_capture(event_id, valid_clips_count, last_error)
                             return
 
@@ -316,9 +389,9 @@ class RecordingCoordinator:
                     remaining = (
                         (session.desired_capture_end - now).total_seconds()
                         if not session.hold
-                        else self.chunk_seconds
+                        else chunk_seconds
                     )
-                    chunk_dur = min(self.chunk_seconds, max(1.0, remaining))
+                    chunk_dur = min(chunk_seconds, max(1.0, remaining), max_remaining)
 
                     # Use requested lookback for first chunk only; subsequent chunks use 0.0
                     lookback = (

@@ -15,6 +15,7 @@ from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, cal
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.helpers import config_validation as cv
 
+from .camera_profiles import get_camera_profiles
 from .const import (
     DATA_COORDINATOR,
     DATA_STORE,
@@ -43,14 +44,15 @@ SCHEMA_LOG_EVENT = vol.Schema(
 
 SCHEMA_RECORD = vol.Schema(
     {
-        vol.Required("source_id"): cv.string,
+        vol.Optional("source_id"): cv.string,
         vol.Required("kind"): cv.string,
-        vol.Required("resource_key"): cv.string,
+        vol.Optional("resource_key"): cv.string,
+        vol.Optional("camera_entity"): cv.entity_id,
         vol.Required("operation"): vol.In(["start_or_extend", "end_after"]),
-        vol.Required("window_seconds"): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=300.0)),
+        vol.Optional("window_seconds"): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=300.0)),
         vol.Optional("occurred_at"): cv.string,
         vol.Optional("idempotency_key"): cv.string,
-        vol.Optional("lookback_seconds", default=0.0): vol.All(
+        vol.Optional("lookback_seconds"): vol.All(
             vol.Coerce(float), vol.Range(min=0.0, max=60.0)
         ),
         vol.Optional("hold", default=False): cv.boolean,
@@ -151,19 +153,34 @@ def async_register_services(hass: HomeAssistant) -> None:
             raise HomeAssistantError("Event Recording integration is not initialized")
 
         data = call.data
-        source_id = data["source_id"]
+        source_id = data.get("source_id")
         kind = data["kind"]
-        resource_key = data["resource_key"]
+        resource_key = data.get("resource_key")
+        shortcut_camera = data.get("camera_entity")
+        if shortcut_camera:
+            if not shortcut_camera.startswith("camera."):
+                raise HomeAssistantError("camera_entity must identify a Home Assistant camera")
+            if resource_key and resource_key != shortcut_camera:
+                raise HomeAssistantError(
+                    "resource_key must match camera_entity when using a camera profile"
+                )
+            resource_key = shortcut_camera
+        if not resource_key:
+            raise HomeAssistantError("resource_key is required unless camera_entity is provided")
         operation = data["operation"]
-        window_seconds = float(data["window_seconds"])
+        window_seconds = data.get("window_seconds")
         occurred_at = data.get("occurred_at") or utc_now()
         idempotency_key = data.get("idempotency_key") or call.context.id or uuid.uuid4().hex
-        lookback_seconds = float(data.get("lookback_seconds", 0.0))
+        lookback_seconds = data.get("lookback_seconds")
         hold = bool(data.get("hold", False))
-        recorder_config = dict(data.get("recorder_config") or {})
+        explicit_recorder_config = dict(data.get("recorder_config") or {})
+        # This key is reserved for the integration's durable per-session snapshot.
+        explicit_recorder_config.pop("_event_recording_profile", None)
+        recorder_config = dict(explicit_recorder_config)
         label = data.get("label")
         payload = data.get("payload") or {}
         raw_access = list(data.get("access_entities") or ())
+        profile_defaults: dict[str, Any] | None = None
 
         # Check adapter configuration
         is_camera = (
@@ -172,6 +189,21 @@ def async_register_services(hass: HomeAssistant) -> None:
             or resource_key.startswith("camera.")
         )
         if is_camera:
+            camera_entity = resource_key
+            profiles = get_camera_profiles(coordinator.entry) if coordinator else {}
+            profile = profiles.get(camera_entity)
+            if shortcut_camera and profile is None:
+                raise HomeAssistantError("No Event Recording profile is configured for this camera")
+            if profile is not None:
+                profile_defaults = dict(profile)
+                if source_id is None:
+                    source_id = profile_defaults.get("source_id")
+                if label is None and "label" not in data:
+                    label = profile_defaults.get("label")
+                if window_seconds is None:
+                    window_seconds = profile_defaults.get("window_seconds", 15)
+                if lookback_seconds is None:
+                    lookback_seconds = profile_defaults.get("lookback_seconds", 0)
             recorder_config["adapter"] = "camera"
             cam_ent = recorder_config.get("camera_entity")
             if cam_ent and cam_ent != resource_key:
@@ -180,19 +212,36 @@ def async_register_services(hass: HomeAssistant) -> None:
                 )
             recorder_config["camera_entity"] = resource_key
 
-            # Always add camera entity to event access_entities automatically to protect camera stream
+            # Always protect camera recordings with the canonical camera entity ACL.
             if resource_key not in raw_access:
                 raw_access.append(resource_key)
 
-            # Human caller requires control permission on camera_entity
             if call.context.user_id is not None:
                 await _check_human_permission(hass, call, [resource_key], "control")
+
+        if source_id is None:
+            raise HomeAssistantError(
+                "source_id is required unless a configured camera profile provides it"
+            )
+        if window_seconds is None:
+            raise HomeAssistantError(
+                "window_seconds is required unless a configured camera profile provides it"
+            )
+        window_seconds = float(window_seconds)
+        lookback_seconds = float(lookback_seconds if lookback_seconds is not None else 0.0)
 
         access_entities = tuple(raw_access)
         if access_entities and call.context.user_id is not None:
             await _check_human_permission(hass, call, access_entities, "control")
 
         admit = coordinator.admit_record_intent if coordinator else store.admit_record_intent
+        extra_admission: dict[str, Any] = {}
+        if coordinator:
+            extra_admission = {
+                "_profile_defaults": profile_defaults,
+                "_explicit_fields": frozenset(data),
+                "_explicit_recorder_config": explicit_recorder_config,
+            }
         event, inserted, intent_id = await admit(
             source_id=source_id,
             kind=kind,
@@ -208,6 +257,7 @@ def async_register_services(hass: HomeAssistant) -> None:
             payload=payload,
             access_entities=access_entities,
             owner_user_id=call.context.user_id,
+            **extra_admission,
         )
 
         if coordinator:

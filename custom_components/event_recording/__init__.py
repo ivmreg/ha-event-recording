@@ -202,5 +202,30 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload config entry after options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
+    """Apply options immediately, reloading only when the media root changes."""
+    from .const import CONF_MEDIA_ROOT, DEFAULT_MEDIA_DIR
+
+    domain_data = hass.data.get(DOMAIN, {})
+    coordinator = domain_data.get(DATA_COORDINATOR)
+    if coordinator is None:
+        await hass.config_entries.async_reload(entry.entry_id)
+        return
+
+    raw_root = str(
+        entry.options.get(CONF_MEDIA_ROOT, entry.data.get(CONF_MEDIA_ROOT, DEFAULT_MEDIA_DIR))
+    ).strip()
+    configured_root = Path(raw_root)
+    effective_root = (
+        configured_root if configured_root.is_absolute() else Path(hass.config.path(raw_root))
+    )
+    try:
+        root_changed = effective_root.resolve() != coordinator.store.media_root.resolve()
+    except (OSError, RuntimeError):
+        root_changed = effective_root != coordinator.store.media_root
+
+    if root_changed:
+        await hass.config_entries.async_reload(entry.entry_id)
+        return
+
+    # Entry options are read dynamically by retention properties and profile lookup.
+    coordinator.entry = entry
