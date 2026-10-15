@@ -40,7 +40,7 @@ var z=`
   .ev-error-box, .ev-error-text { padding: 12px 16px; color: var(--ev-error); font-size: .85rem; overflow-wrap: anywhere; }
   .ev-drawer-backdrop { width: min(640px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px); margin: auto; padding: 0; border: 1px solid var(--ev-border); border-radius: 14px; background: var(--ev-card-bg); color: var(--ev-text-primary); box-shadow: 0 16px 64px rgba(0,0,0,.3); }
   .ev-drawer-backdrop::backdrop { background: rgba(0,0,0,.55); }
-  .ev-drawer { display: flex; flex-direction: column; max-height: inherit; overflow-y: auto; overflow-x: hidden; }
+  .ev-drawer { display: flex; flex-direction: column; }
   .ev-drawer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--ev-border); background: var(--ev-card-bg); }
   .ev-drawer-title-group { min-width: 0; }
   .ev-drawer-title { font-size: 1rem; font-weight: 500; line-height: 1.4; margin: 0; overflow-wrap: anywhere; }
