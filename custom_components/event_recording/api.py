@@ -1,0 +1,157 @@
+"""Canonical public facade for the Event Recording integration.
+
+Provides a neutral Python API for other integrations and consumers to interact with
+durable event storage, resolve verified media paths, subscribe to revisions,
+and register consumer capabilities without coupling to concrete AI analyzers.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any
+
+from homeassistant.core import HomeAssistant
+
+from .const import DATA_API, DOMAIN
+from .core.models import MediaItem, RecordedEvent
+from .core.store import JournalStore
+
+
+class ConsumerRegistration:
+    """Represents a registered consumer capability."""
+
+    def __init__(
+        self,
+        consumer_id: str,
+        retry_callback: Callable[[str], Awaitable[bool]],
+        available: bool = True,
+    ) -> None:
+        self.id = consumer_id
+        self.retry_callback = retry_callback
+        self.available = available
+
+
+class RecordingAPI:
+    """Canonical public facade for Event Recording."""
+
+    def __init__(self, hass: HomeAssistant, store: JournalStore) -> None:
+        self._hass = hass
+        self._store = store
+        self._consumers: dict[str, ConsumerRegistration] = {}
+
+    @property
+    def store(self) -> JournalStore:
+        """Return the underlying JournalStore for pure core reads, writes, and CAS annotations."""
+        return self._store
+
+    async def get_event(self, event_id: str) -> RecordedEvent | None:
+        """Async delegate to store.get_event."""
+        return await self._store.get_event(event_id)
+
+    async def resolve_media(self, event_id: str, media_id: str) -> Path:
+        """Verify media association and availability, returning the absolute filesystem Path.
+
+        Raises KeyError if event or media is missing, ValueError if unavailable,
+        PermissionError if path traversal is detected, or FileNotFoundError if missing on disk.
+        """
+        event = await self._store.get_event(event_id)
+        if not event:
+            raise KeyError(f"Event '{event_id}' not found")
+
+        matching: MediaItem | None = None
+        for item in event.media:
+            if item.id == media_id:
+                matching = item
+                break
+
+        if not matching:
+            raise KeyError(f"Media '{media_id}' not associated with event '{event_id}'")
+
+        if not matching.available:
+            raise ValueError(f"Media '{media_id}' is marked unavailable")
+
+        # Verify containment and existence off-loop to avoid blocking the event loop
+        def _verify_path_containment() -> tuple[Path, bool, bool]:
+            media_root = self._store.media_root.resolve()
+            target_path = (media_root / matching.file_name).resolve()
+            is_contained = target_path.is_relative_to(media_root)
+            exists = target_path.is_file() if is_contained else False
+            return target_path, is_contained, exists
+
+        target_path, is_contained, exists = await self._hass.async_add_executor_job(
+            _verify_path_containment
+        )
+
+        if not is_contained:
+            raise PermissionError(
+                f"Path traversal detected: {target_path} outside {self._store.media_root}"
+            )
+
+        if not exists:
+            raise FileNotFoundError(f"Media file not found on disk: {target_path}")
+
+        return target_path
+
+    def subscribe(self, callback: Callable[[str, int], None]) -> Callable[[], None]:
+        """Subscribe to post-commit event revision updates."""
+        return self._store.subscribe(callback)
+
+    def register_consumer(
+        self,
+        consumer_id: str,
+        retry_callback: Callable[[str], Awaitable[bool]],
+        available: bool = True,
+    ) -> Callable[[], None]:
+        """Register an external consumer for capabilities and retry delegation."""
+        reg = ConsumerRegistration(consumer_id, retry_callback, available)
+        self._consumers[consumer_id] = reg
+
+        def _unsubscribe() -> None:
+            # Only remove if the current registration is still this exact instance
+            if self._consumers.get(consumer_id) is reg:
+                self._consumers.pop(consumer_id, None)
+
+        return _unsubscribe
+
+    def get_registered_consumers(self) -> list[dict[str, Any]]:
+        """Return list of registered consumers for WebSocket capabilities reporting."""
+        return [
+            {
+                "id": c.id,
+                "available": c.available,
+                "can_retry": True,
+            }
+            for c in self._consumers.values()
+        ]
+
+    async def trigger_consumer_retry(self, consumer_id: str, event_id: str) -> bool:
+        """Trigger registered consumer retry callback."""
+        consumer = self._consumers.get(consumer_id)
+        if not consumer or not consumer.available:
+            return False
+        try:
+            return await consumer.retry_callback(event_id)
+        except Exception:
+            return False
+
+    @property
+    def ffmpeg_binary(self) -> str | None:
+        """Return available ffmpeg binary path, if configured."""
+        try:
+            from homeassistant.components.ffmpeg import get_ffmpeg_manager
+
+            mgr = get_ffmpeg_manager(self._hass)
+            if mgr and getattr(mgr, "binary", None):
+                return str(mgr.binary)
+        except Exception:
+            pass
+        return None
+
+
+def get_api(hass: HomeAssistant) -> RecordingAPI | None:
+    """Retrieve canonical RecordingAPI instance from Home Assistant."""
+    domain_data = hass.data.get(DOMAIN)
+    if not domain_data:
+        return None
+    return domain_data.get(DATA_API)

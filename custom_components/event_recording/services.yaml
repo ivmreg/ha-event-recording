@@ -1,0 +1,197 @@
+log_event:
+  name: Log Event
+  description: Record a structured trigger or sensor event directly into the durable event journal.
+  fields:
+    source_id:
+      name: Source ID
+      description: Identifier of the triggering entity or physical device.
+      required: true
+      example: binary_sensor.front_door
+      selector:
+        text: {}
+    kind:
+      name: Kind
+      description: Bounded event kind string (e.g. motion, contact, doorbell, mqtt).
+      required: true
+      example: motion
+      selector:
+        text: {}
+    occurred_at:
+      name: Occurred At
+      description: Timestamp when the event occurred (ISO string). Defaults to current UTC time.
+      required: false
+      selector:
+        datetime: {}
+    idempotency_key:
+      name: Idempotency Key
+      description: Unique deduplication key. Defaults to automation context ID.
+      required: false
+      selector:
+        text: {}
+    label:
+      name: Label
+      description: Optional human-readable event title or description.
+      required: false
+      example: Front Door Motion
+      selector:
+        text: {}
+    payload:
+      name: Payload
+      description: Optional arbitrary JSON dictionary payload.
+      required: false
+      selector:
+        object: {}
+    access_entities:
+      name: Access Entities
+      description: Optional list of entity IDs controlling user read/write access.
+      required: false
+      selector:
+        entity:
+          multiple: true
+
+record:
+  name: Record
+  description: Queue a durable recording intent to capture media from camera or stream adapters.
+  fields:
+    source_id:
+      name: Source ID
+      description: Identifier of the triggering source or automation.
+      required: true
+      example: binary_sensor.front_door_contact
+      selector:
+        text: {}
+    kind:
+      name: Kind
+      description: Event kind string (e.g. contact_open, button_press).
+      required: true
+      example: contact_open
+      selector:
+        text: {}
+    resource_key:
+      name: Resource Key
+      description: Canonical stream serialization key (e.g. camera entity ID).
+      required: true
+      example: camera.front_door
+      selector:
+        text: {}
+    operation:
+      name: Operation
+      description: Whether to start/extend an active episode or schedule closure.
+      required: true
+      selector:
+        select:
+          options:
+            - start_or_extend
+            - end_after
+    window_seconds:
+      name: Window Seconds
+      description: Desired duration in seconds for this capture segment or tail (1-300).
+      required: true
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 300
+    occurred_at:
+      name: Occurred At
+      description: Timestamp when the trigger occurred. Defaults to now.
+      required: false
+      selector:
+        datetime: {}
+    idempotency_key:
+      name: Idempotency Key
+      description: Unique deduplication key.
+      required: false
+      selector:
+        text: {}
+    lookback_seconds:
+      name: Lookback Seconds
+      description: Seconds of pre-event buffer to capture (0-60).
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 60
+    hold:
+      name: Hold
+      description: Keep recording continuously until explicit end_after or bounded 300s timeout.
+      required: false
+      default: false
+      selector:
+        boolean: {}
+    recorder_config:
+      name: Recorder Config
+      description: Private configuration for chosen recorder adapter.
+      required: false
+      selector:
+        object: {}
+    label:
+      name: Label
+      description: Optional human-readable event label.
+      required: false
+      selector:
+        text: {}
+    payload:
+      name: Payload
+      description: Optional metadata payload.
+      required: false
+      selector:
+        object: {}
+    access_entities:
+      name: Access Entities
+      description: Entity IDs governing access.
+      required: false
+      selector:
+        entity:
+          multiple: true
+
+attach_media:
+  name: Attach Media
+  description: Atomically import, validate, and attach an external media file to an event.
+  fields:
+    event_id:
+      name: Event ID
+      description: Identifier of the target event.
+      required: true
+      selector:
+        text: {}
+    media_locator:
+      name: Media Locator
+      description: Filesystem path to the media file within permitted storage roots.
+      required: true
+      selector:
+        text: {}
+    kind:
+      name: Kind
+      description: Media type (video or image).
+      required: false
+      selector:
+        select:
+          options:
+            - video
+            - image
+    mime_type:
+      name: MIME Type
+      description: Explicit MIME type.
+      required: false
+      selector:
+        text: {}
+    finalize:
+      name: Finalize
+      description: Whether to finalize the event after promoting this media asset.
+      required: false
+      default: true
+      selector:
+        boolean: {}
+
+finalize:
+  name: Finalize Event
+  description: Explicitly conclude recording and mark an event ready for consumer analysis.
+  fields:
+    event_id:
+      name: Event ID
+      description: Identifier of the event to finalize.
+      required: true
+      selector:
+        text: {}

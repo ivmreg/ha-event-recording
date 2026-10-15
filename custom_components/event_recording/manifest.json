@@ -1,0 +1,12 @@
+{
+  "domain": "event_recording",
+  "name": "Event Recording",
+  "codeowners": ["@ivmreg"],
+  "config_flow": true,
+  "documentation": "https://github.com/ivmreg/ha-event-vision",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/ivmreg/ha-event-vision/issues",
+  "dependencies": ["http", "websocket_api"],
+  "requirements": [],
+  "version": "0.2.0"
+}

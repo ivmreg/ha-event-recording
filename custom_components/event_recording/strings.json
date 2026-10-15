@@ -1,0 +1,41 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Event Recording Setup",
+        "description": "Configure storage directory and retention budgets for neutral event recording. Zero AI dependencies or camera requirements.",
+        "data": {
+          "media_root": "Owned Media Storage Directory",
+          "retention_size_mb": "Maximum Storage Budget (MB)",
+          "retention_days": "Retention Duration (Days)",
+          "chunk_seconds": "Recording Chunk Duration (Seconds, max 15)"
+        }
+      }
+    },
+    "error": {
+      "invalid_chunk_seconds": "Chunk duration must be between 1 and 15 seconds.",
+      "www_forbidden": "Storage directory cannot be placed inside public www.",
+      "invalid_media_root": "Choose a dedicated private subdirectory; the configuration root and its parents cannot own recordings.",
+      "media_dir_exposed": "Choose storage outside every shared media directory."
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single instance of Event Recording is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Event Recording Options",
+        "description": "Update retention budgets and recording chunk parameters.",
+        "data": {
+          "retention_size_mb": "Maximum Storage Budget (MB)",
+          "retention_days": "Retention Duration (Days)",
+          "chunk_seconds": "Recording Chunk Duration (Seconds, max 15)"
+        }
+      }
+    },
+    "error": {
+      "invalid_chunk_seconds": "Chunk duration must be between 1 and 15 seconds."
+    }
+  }
+}
