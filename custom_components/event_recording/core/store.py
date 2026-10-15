@@ -2148,6 +2148,22 @@ class JournalStore:
                     if unlink_success:
                         cur.execute("UPDATE media SET available = 0 WHERE id = ?;", (m["id"],))
 
+                        # Derived previews must expire with their source media. They are
+                        # disposable and regenerated for the next media revision.
+                        thumbs = self._media_root / "thumbnails"
+                        if thumbs.is_dir() and not thumbs.is_symlink():
+                            for thumb in thumbs.iterdir():
+                                if (
+                                    thumb.name.startswith(f"{m['event_id']}_r")
+                                    and thumb.name.endswith("_thumb.jpg")
+                                    and not thumb.is_symlink()
+                                    and thumb.resolve().is_relative_to(self._media_root.resolve())
+                                ):
+                                    try:
+                                        thumb.unlink(missing_ok=True)
+                                    except OSError:
+                                        errors.append("Failed to remove derived thumbnail")
+
                         # Check if event has any available media left
                         cur.execute(
                             "SELECT 1 FROM media WHERE event_id = ? AND available = 1 LIMIT 1;",

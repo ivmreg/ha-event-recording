@@ -59,10 +59,12 @@ class EventRecordingMediaView(HomeAssistantView):
         def _resolve_target_media() -> tuple[Path | None, str | None, int]:
             resolved_root = media_root.resolve()
             if media_id == "thumbnail":
-                thumb_path = (resolved_root / "thumbnails" / f"{event_id}_thumb.jpg").resolve()
+                from .thumbnails import thumbnail_path
+
+                thumb_path = thumbnail_path(resolved_root, event).resolve()
                 if not thumb_path.is_relative_to(resolved_root):
                     return None, None, 403
-                if thumb_path.is_file():
+                if thumb_path.is_file() and any(m.available for m in event.media):
                     return thumb_path, "image/jpeg", 200
 
                 img_item = next((m for m in event.media if m.kind == "image" and m.available), None)

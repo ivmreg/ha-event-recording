@@ -331,17 +331,24 @@ async def ws_handle_media(
     expires_in = max(30, min(int(msg.get("expires_in", 300)), 300))
     media_root = store.media_root
 
+    if thumbnail_id == "thumbnail":
+        from .thumbnails import async_ensure_thumbnail
+
+        await async_ensure_thumbnail(hass, store, event)
+
     def _verify_media_target() -> tuple[str | None, str | None, int]:
         resolved_root = media_root.resolve()
         if thumbnail_id:
             if thumbnail_id != "thumbnail":
                 return None, None, 400
 
-            thumb_file = (resolved_root / "thumbnails" / f"{event_id}_thumb.jpg").resolve()
+            from .thumbnails import thumbnail_path
+
+            thumb_file = thumbnail_path(resolved_root, event).resolve()
             if not thumb_file.is_relative_to(resolved_root):
                 return None, None, 403
 
-            if thumb_file.is_file():
+            if thumb_file.is_file() and any(m.available for m in event.media):
                 return "thumbnail", "image/jpeg", 200
 
             img_item = next((m for m in event.media if m.kind == "image" and m.available), None)
