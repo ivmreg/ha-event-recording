@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 from .const import DEFAULT_WATCHDOG_PADDING_SECONDS
 from .core.models import sanitize_capture_error
+from .error_diagnostics import format_safe_exception_diagnostics
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -507,7 +508,16 @@ class CameraRecorderAdapter:
                 raise
             except Exception as err:
                 clean_err = sanitize_capture_error(err) or "CAMERA_RECORD_FAILED"
-                _LOGGER.error("Camera recording failed for %s: %s", camera_entity, clean_err)
+                try:
+                    diag = format_safe_exception_diagnostics(err)
+                except Exception:
+                    diag = "diagnostics_unavailable"
+                _LOGGER.error(
+                    "Camera recording failed for %s: %s [%s]",
+                    camera_entity,
+                    clean_err,
+                    diag,
+                )
                 raise RecorderError(clean_err) from err
             finally:
                 self.registry.release_active(camera_entity, record_task, ownership_group)
@@ -604,7 +614,16 @@ class SnapshotRecorderAdapter:
                 raise
             except Exception as err:
                 clean_err = sanitize_capture_error(err) or "CAMERA_SNAPSHOT_FAILED"
-                _LOGGER.error("Camera snapshot failed for %s: %s", camera_entity, clean_err)
+                try:
+                    diag = format_safe_exception_diagnostics(err)
+                except Exception:
+                    diag = "diagnostics_unavailable"
+                _LOGGER.error(
+                    "Camera snapshot failed for %s: %s [%s]",
+                    camera_entity,
+                    clean_err,
+                    diag,
+                )
                 raise RecorderError(clean_err) from err
             finally:
                 self.registry.release_active(camera_entity, op_task, ownership_group)
