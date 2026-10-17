@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 from .const import DEFAULT_WATCHDOG_PADDING_SECONDS
 from .core.models import sanitize_capture_error
-from .error_diagnostics import format_safe_exception_diagnostics
+from .error_diagnostics import format_redacted_exception_traceback
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -509,11 +509,13 @@ class CameraRecorderAdapter:
             except Exception as err:
                 clean_err = sanitize_capture_error(err) or "CAMERA_RECORD_FAILED"
                 try:
-                    diag = format_safe_exception_diagnostics(err)
+                    diag = await self.hass.async_add_executor_job(
+                        format_redacted_exception_traceback, err
+                    )
                 except Exception:
-                    diag = "diagnostics_unavailable"
+                    diag = "Traceback unavailable (diagnostic formatting failed)."
                 _LOGGER.error(
-                    "Camera recording failed for %s: %s [%s]",
+                    "Camera recording failed for %s: %s\n%s",
                     camera_entity,
                     clean_err,
                     diag,
@@ -615,11 +617,13 @@ class SnapshotRecorderAdapter:
             except Exception as err:
                 clean_err = sanitize_capture_error(err) or "CAMERA_SNAPSHOT_FAILED"
                 try:
-                    diag = format_safe_exception_diagnostics(err)
+                    diag = await self.hass.async_add_executor_job(
+                        format_redacted_exception_traceback, err
+                    )
                 except Exception:
-                    diag = "diagnostics_unavailable"
+                    diag = "Traceback unavailable (diagnostic formatting failed)."
                 _LOGGER.error(
-                    "Camera snapshot failed for %s: %s [%s]",
+                    "Camera snapshot failed for %s: %s\n%s",
                     camera_entity,
                     clean_err,
                     diag,
