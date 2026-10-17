@@ -6,6 +6,22 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from .core.validation import (
+    SPEC_CHUNK_SECONDS,
+    SPEC_EXPORT_DELAY_SECONDS,
+    SPEC_FRIGATE_CAMERA_NAME,
+    SPEC_GROUP_OR_ZONE,
+    SPEC_LABEL,
+    SPEC_LOOKBACK_SECONDS,
+    SPEC_MAX_WINDOW_SECONDS,
+    SPEC_SOURCE_CLOCK_OFFSET_SECONDS,
+    SPEC_SOURCE_ID,
+    SPEC_SOURCE_TIME_UNCERTAINTY_SECONDS,
+    SPEC_TAIL_WINDOW_SECONDS,
+    SPEC_WINDOW_SECONDS,
+    ValidationError,
+)
+
 CAMERA_PROFILES = "camera_profiles"
 
 
@@ -66,23 +82,29 @@ def validate_camera_profile(camera_entity: str, profile: Mapping[str, Any]) -> d
     ):
         errors["camera_entity"] = "invalid_camera_entity"
 
-    for field, maximum, minimum in (
-        ("window_seconds", 300, 1),
-        ("lookback_seconds", 60, 0),
-        ("chunk_seconds", 15, 1),
-        ("max_window_seconds", 300, 1),
+    for field, num_spec in (
+        ("window_seconds", SPEC_WINDOW_SECONDS),
+        ("lookback_seconds", SPEC_LOOKBACK_SECONDS),
+        ("chunk_seconds", SPEC_CHUNK_SECONDS),
+        ("max_window_seconds", SPEC_MAX_WINDOW_SECONDS),
     ):
         value = profile.get(field)
-        if type(value) is not int or not minimum <= value <= maximum:
+        if type(value) is not int:
+            errors[field] = f"invalid_{field}"
+            continue
+        try:
+            num_spec.validate(value)
+        except ValidationError:
             errors[field] = f"invalid_{field}"
 
     if "window_seconds" not in errors and "max_window_seconds" not in errors:
         if profile["max_window_seconds"] < profile["window_seconds"]:
             errors["max_window_seconds"] = "max_window_below_window"
 
-    for field, max_length in (("source_id", 128), ("label", 256)):
-        value = profile.get(field)
-        if not isinstance(value, str) or not value.strip() or len(value) > max_length:
+    for field, str_spec in (("source_id", SPEC_SOURCE_ID), ("label", SPEC_LABEL)):
+        try:
+            str_spec.validate(profile.get(field))
+        except ValidationError:
             errors[field] = f"invalid_{field}"
 
     recording_mode = profile.get("recording_mode", "extend")
@@ -97,47 +119,30 @@ def validate_camera_profile(camera_entity: str, profile: Mapping[str, Any]) -> d
             or not (base_url.startswith("http://") or base_url.startswith("https://"))
         ):
             errors["frigate_base_url"] = "invalid_frigate_base_url"
-        if not isinstance(cam_name, str) or not re.match(r"^[a-zA-Z0-9_-]+$", cam_name):
+        try:
+            SPEC_FRIGATE_CAMERA_NAME.validate(cam_name)
+        except ValidationError:
             errors["frigate_camera_name"] = "invalid_frigate_camera_name"
         export_delay = profile.get("export_delay_seconds", 5)
-        if type(export_delay) is not int or not 0 <= export_delay <= 60:
+        if type(export_delay) is not int:
             errors["export_delay_seconds"] = "invalid_export_delay_seconds"
+        else:
+            try:
+                SPEC_EXPORT_DELAY_SECONDS.validate(export_delay)
+            except ValidationError:
+                errors["export_delay_seconds"] = "invalid_export_delay_seconds"
 
-    ownership_group = profile.get("ownership_group")
-    if ownership_group is not None and ownership_group != "":
-        if (
-            not isinstance(ownership_group, str)
-            or len(ownership_group) > 64
-            or any(ord(c) < 32 or ord(c) == 127 for c in ownership_group)
-        ):
-            errors["ownership_group"] = "invalid_ownership_group"
+    for group_field in ("ownership_group", "correlation_group", "zone"):
+        raw_grp = profile.get(group_field)
+        if raw_grp is not None and raw_grp != "":
+            try:
+                SPEC_GROUP_OR_ZONE.validate(raw_grp)
+            except ValidationError:
+                errors[group_field] = f"invalid_{group_field}"
 
     hold = profile.get("hold")
     if hold is not None and not isinstance(hold, bool):
         errors["hold"] = "invalid_hold"
-
-    tail = profile.get("tail_window_seconds")
-    if tail is not None:
-        if type(tail) not in (int, float) or isinstance(tail, bool) or not (0.0 <= tail <= 300.0):
-            errors["tail_window_seconds"] = "invalid_tail_window_seconds"
-
-    corr_group = profile.get("correlation_group")
-    if corr_group is not None and corr_group != "":
-        if (
-            not isinstance(corr_group, str)
-            or len(corr_group) > 64
-            or any(ord(c) < 32 or ord(c) == 127 for c in corr_group)
-        ):
-            errors["correlation_group"] = "invalid_correlation_group"
-
-    zone = profile.get("zone")
-    if zone is not None and zone != "":
-        if (
-            not isinstance(zone, str)
-            or len(zone) > 64
-            or any(ord(c) < 32 or ord(c) == 127 for c in zone)
-        ):
-            errors["zone"] = "invalid_zone"
 
     adj_zones = profile.get("adjacent_zones")
     if adj_zones is not None:
@@ -145,22 +150,22 @@ def validate_camera_profile(camera_entity: str, profile: Mapping[str, Any]) -> d
             errors["adjacent_zones"] = "invalid_adjacent_zones"
         else:
             for az in adj_zones:
-                if (
-                    not isinstance(az, str)
-                    or len(az) > 64
-                    or any(ord(c) < 32 or ord(c) == 127 for c in az)
-                ):
+                try:
+                    SPEC_GROUP_OR_ZONE.validate(az)
+                except ValidationError:
                     errors["adjacent_zones"] = "invalid_adjacent_zones"
                     break
 
-    offset = profile.get("source_clock_offset_seconds")
-    if offset is not None:
-        if type(offset) not in (int, float) or isinstance(offset, bool) or not (-3600.0 <= offset <= 3600.0):
-            errors["source_clock_offset_seconds"] = "invalid_source_clock_offset_seconds"
-
-    uncertainty = profile.get("source_time_uncertainty_seconds")
-    if uncertainty is not None:
-        if type(uncertainty) not in (int, float) or isinstance(uncertainty, bool) or not (0.0 <= uncertainty <= 300.0):
-            errors["source_time_uncertainty_seconds"] = "invalid_source_time_uncertainty_seconds"
+    for float_field, float_spec in (
+        ("tail_window_seconds", SPEC_TAIL_WINDOW_SECONDS),
+        ("source_clock_offset_seconds", SPEC_SOURCE_CLOCK_OFFSET_SECONDS),
+        ("source_time_uncertainty_seconds", SPEC_SOURCE_TIME_UNCERTAINTY_SECONDS),
+    ):
+        f_val = profile.get(float_field)
+        if f_val is not None:
+            try:
+                float_spec.validate(f_val)
+            except ValidationError:
+                errors[float_field] = f"invalid_{float_field}"
 
     return errors

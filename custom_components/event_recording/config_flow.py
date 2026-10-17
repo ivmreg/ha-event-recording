@@ -54,15 +54,25 @@ from .const import (
     MODE_NATIVE_FIXED,
     MODE_NATIVE_SNAPSHOT,
 )
-
-
-class _IntegerNumberSelector(selector.NumberSelector):
-    """Native number selector that rejects booleans before float coercion."""
-
-    def __call__(self, data: Any) -> float:
-        if isinstance(data, bool):
-            raise vol.Invalid("Boolean values are not numbers")
-        return super().__call__(data)
+from .core.validation import (
+    SPEC_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+    SPEC_CHUNK_SECONDS,
+    SPEC_EXPORT_DELAY_SECONDS,
+    SPEC_LOOKBACK_SECONDS,
+    SPEC_MAX_INCIDENT_SPAN_SECONDS,
+    SPEC_MAX_PARALLEL_RESOURCES,
+    SPEC_MAX_QUEUE_DEPTH,
+    SPEC_MAX_WINDOW_SECONDS,
+    SPEC_MIN_DISK_FREE_MB,
+    SPEC_QUEUE_WAIT_TIMEOUT_SECONDS,
+    SPEC_RETENTION_DAYS,
+    SPEC_RETENTION_SIZE_MB,
+    SPEC_SOURCE_CLOCK_OFFSET_SECONDS,
+    SPEC_SOURCE_TIME_UNCERTAINTY_SECONDS,
+    SPEC_WINDOW_SECONDS,
+    ValidationError,
+)
+from .validation import number_spec_selector
 
 
 def validate_media_root(hass: Any, raw_media: str) -> str | None:
@@ -113,10 +123,16 @@ class EventRecordingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if err:
                 errors[CONF_MEDIA_ROOT] = err
 
-            # 2. Validate chunk_seconds <= 15
-            chunk_seconds = user_input.get(CONF_CHUNK_SECONDS, DEFAULT_CHUNK_SECONDS)
-            if chunk_seconds > 15 or chunk_seconds < 1:
-                errors[CONF_CHUNK_SECONDS] = "invalid_chunk_seconds"
+            # 2. Validate numeric parameters against shared declarative specs
+            for field, spec, err_key in (
+                (CONF_RETENTION_SIZE_MB, SPEC_RETENTION_SIZE_MB, "retention_size_too_low"),
+                (CONF_RETENTION_DAYS, SPEC_RETENTION_DAYS, "retention_days_too_low"),
+                (CONF_CHUNK_SECONDS, SPEC_CHUNK_SECONDS, "invalid_chunk_seconds"),
+            ):
+                try:
+                    user_input[field] = int(spec.validate(user_input.get(field, spec.default)))
+                except (ValidationError, ValueError, TypeError):
+                    errors[field] = err_key
 
             if not errors:
                 return self.async_create_entry(
@@ -127,14 +143,14 @@ class EventRecordingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Required(CONF_MEDIA_ROOT, default=DEFAULT_MEDIA_DIR): str,
-                vol.Required(CONF_RETENTION_SIZE_MB, default=DEFAULT_RETENTION_SIZE_MB): vol.All(
-                    vol.Coerce(int), vol.Range(min=50)
+                vol.Required(CONF_RETENTION_SIZE_MB, default=DEFAULT_RETENTION_SIZE_MB): number_spec_selector(
+                    SPEC_RETENTION_SIZE_MB
                 ),
-                vol.Required(CONF_RETENTION_DAYS, default=DEFAULT_RETENTION_DAYS): vol.All(
-                    vol.Coerce(int), vol.Range(min=1)
+                vol.Required(CONF_RETENTION_DAYS, default=DEFAULT_RETENTION_DAYS): number_spec_selector(
+                    SPEC_RETENTION_DAYS
                 ),
-                vol.Required(CONF_CHUNK_SECONDS, default=DEFAULT_CHUNK_SECONDS): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=15)
+                vol.Required(CONF_CHUNK_SECONDS, default=DEFAULT_CHUNK_SECONDS): number_spec_selector(
+                    SPEC_CHUNK_SECONDS
                 ),
             }
         )
@@ -182,35 +198,38 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            chunk_seconds = user_input.get(CONF_CHUNK_SECONDS, DEFAULT_CHUNK_SECONDS)
-            if chunk_seconds > 15 or chunk_seconds < 1:
-                errors[CONF_CHUNK_SECONDS] = "invalid_chunk_seconds"
-            max_parallel = user_input.get(
-                CONF_MAX_PARALLEL_RESOURCES, DEFAULT_MAX_PARALLEL_RESOURCES
-            )
-            if max_parallel < 1 or max_parallel > 8:
-                errors[CONF_MAX_PARALLEL_RESOURCES] = "invalid_max_parallel"
-            max_queue = user_input.get(CONF_MAX_QUEUE_DEPTH, DEFAULT_MAX_QUEUE_DEPTH)
-            if max_queue < 1 or max_queue > 256:
-                errors[CONF_MAX_QUEUE_DEPTH] = "invalid_max_queue_depth"
-            queue_timeout = user_input.get(
-                CONF_QUEUE_WAIT_TIMEOUT_SECONDS, DEFAULT_QUEUE_WAIT_TIMEOUT_SECONDS
-            )
-            if queue_timeout < 1 or queue_timeout > 300:
-                errors[CONF_QUEUE_WAIT_TIMEOUT_SECONDS] = "invalid_queue_timeout"
+            for field, spec, err_key in (
+                (CONF_CHUNK_SECONDS, SPEC_CHUNK_SECONDS, "invalid_chunk_seconds"),
+                (CONF_MAX_PARALLEL_RESOURCES, SPEC_MAX_PARALLEL_RESOURCES, "invalid_max_parallel"),
+                (CONF_MAX_QUEUE_DEPTH, SPEC_MAX_QUEUE_DEPTH, "invalid_max_queue_depth"),
+                (CONF_QUEUE_WAIT_TIMEOUT_SECONDS, SPEC_QUEUE_WAIT_TIMEOUT_SECONDS, "invalid_queue_timeout"),
+            ):
+                try:
+                    user_input[field] = int(spec.validate(user_input.get(field, spec.default)))
+                except (ValidationError, ValueError, TypeError):
+                    errors[field] = err_key
 
             if CONF_ENABLE_AUTO_ASSOCIATION in user_input:
                 user_input[CONF_ENABLE_AUTO_ASSOCIATION] = bool(
                     user_input[CONF_ENABLE_AUTO_ASSOCIATION]
                 )
-            if CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS in user_input:
-                raw_tol = user_input[CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS]
-                if not isinstance(raw_tol, (int, float)) or not (1.0 <= float(raw_tol) <= 60.0):
-                    errors[CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS] = "invalid_tolerance"
-            if CONF_MAX_INCIDENT_SPAN_SECONDS in user_input:
-                raw_span = user_input[CONF_MAX_INCIDENT_SPAN_SECONDS]
-                if not isinstance(raw_span, (int, float)) or not (10.0 <= float(raw_span) <= 3600.0):
-                    errors[CONF_MAX_INCIDENT_SPAN_SECONDS] = "invalid_max_incident_span"
+            for field, spec, err_key in (
+                (
+                    CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+                    SPEC_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+                    "invalid_tolerance",
+                ),
+                (
+                    CONF_MAX_INCIDENT_SPAN_SECONDS,
+                    SPEC_MAX_INCIDENT_SPAN_SECONDS,
+                    "invalid_max_incident_span",
+                ),
+            ):
+                if field in user_input:
+                    try:
+                        user_input[field] = float(spec.validate(user_input[field]))
+                    except (ValidationError, ValueError, TypeError):
+                        errors[field] = err_key
 
             if not errors:
                 return self.async_create_entry(
@@ -257,25 +276,25 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_CHUNK_SECONDS, default=current_chunk): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=15)
+                vol.Required(CONF_CHUNK_SECONDS, default=current_chunk): number_spec_selector(
+                    SPEC_CHUNK_SECONDS
                 ),
-                vol.Required(CONF_MAX_PARALLEL_RESOURCES, default=current_parallel): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=8)
+                vol.Required(CONF_MAX_PARALLEL_RESOURCES, default=current_parallel): number_spec_selector(
+                    SPEC_MAX_PARALLEL_RESOURCES
                 ),
-                vol.Required(CONF_MAX_QUEUE_DEPTH, default=current_queue_depth): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=256)
+                vol.Required(CONF_MAX_QUEUE_DEPTH, default=current_queue_depth): number_spec_selector(
+                    SPEC_MAX_QUEUE_DEPTH
                 ),
                 vol.Required(
                     CONF_QUEUE_WAIT_TIMEOUT_SECONDS, default=current_queue_timeout
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
+                ): number_spec_selector(SPEC_QUEUE_WAIT_TIMEOUT_SECONDS),
                 vol.Required(CONF_ENABLE_AUTO_ASSOCIATION, default=bool(current_enable_auto)): bool,
                 vol.Required(
                     CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS, default=float(current_auto_tol)
-                ): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=60.0)),
+                ): number_spec_selector(SPEC_AUTO_ASSOCIATION_TOLERANCE_SECONDS, step=1.0),
                 vol.Required(
                     CONF_MAX_INCIDENT_SPAN_SECONDS, default=float(current_max_span)
-                ): vol.All(vol.Coerce(float), vol.Range(min=10.0, max=3600.0)),
+                ): number_spec_selector(SPEC_MAX_INCIDENT_SPAN_SECONDS, step=10.0),
             }
         )
 
@@ -292,19 +311,15 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            min_disk = user_input.get(CONF_MIN_DISK_FREE_MB, DEFAULT_MIN_DISK_FREE_MB)
-            if min_disk < 50:
-                errors[CONF_MIN_DISK_FREE_MB] = "min_disk_free_too_low"
-            retention_size = user_input.get(
-                CONF_RETENTION_SIZE_MB, DEFAULT_RETENTION_SIZE_MB
-            )
-            if retention_size < 50:
-                errors[CONF_RETENTION_SIZE_MB] = "retention_size_too_low"
-            retention_days = user_input.get(
-                CONF_RETENTION_DAYS, DEFAULT_RETENTION_DAYS
-            )
-            if retention_days < 1:
-                errors[CONF_RETENTION_DAYS] = "retention_days_too_low"
+            for field, spec, err_key in (
+                (CONF_MIN_DISK_FREE_MB, SPEC_MIN_DISK_FREE_MB, "min_disk_free_too_low"),
+                (CONF_RETENTION_SIZE_MB, SPEC_RETENTION_SIZE_MB, "retention_size_too_low"),
+                (CONF_RETENTION_DAYS, SPEC_RETENTION_DAYS, "retention_days_too_low"),
+            ):
+                try:
+                    user_input[field] = int(spec.validate(user_input.get(field, spec.default)))
+                except (ValidationError, ValueError, TypeError):
+                    errors[field] = err_key
 
             if not errors:
                 return self.async_create_entry(
@@ -327,15 +342,15 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_RETENTION_SIZE_MB, default=current_size): vol.All(
-                    vol.Coerce(int), vol.Range(min=50)
+                vol.Required(CONF_RETENTION_SIZE_MB, default=current_size): number_spec_selector(
+                    SPEC_RETENTION_SIZE_MB
                 ),
-                vol.Required(CONF_RETENTION_DAYS, default=current_days): vol.All(
-                    vol.Coerce(int), vol.Range(min=1)
+                vol.Required(CONF_RETENTION_DAYS, default=current_days): number_spec_selector(
+                    SPEC_RETENTION_DAYS
                 ),
                 vol.Required(
                     CONF_MIN_DISK_FREE_MB, default=max(50, current_min_disk)
-                ): vol.All(vol.Coerce(int), vol.Range(min=50, max=10240)),
+                ): number_spec_selector(SPEC_MIN_DISK_FREE_MB),
             }
         )
 
@@ -693,32 +708,16 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 ): str,
                 vol.Required(
                     "window_seconds", default=profile.get("window_seconds", 15)
-                ): _IntegerNumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=1, max=300, step=1, mode=selector.NumberSelectorMode.BOX
-                    )
-                ),
+                ): number_spec_selector(SPEC_WINDOW_SECONDS),
                 vol.Required(
                     "lookback_seconds", default=profile.get("lookback_seconds", 0)
-                ): _IntegerNumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=0, max=60, step=1, mode=selector.NumberSelectorMode.BOX
-                    )
-                ),
+                ): number_spec_selector(SPEC_LOOKBACK_SECONDS),
                 vol.Required(
                     "chunk_seconds", default=profile.get("chunk_seconds", 10)
-                ): _IntegerNumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=1, max=15, step=1, mode=selector.NumberSelectorMode.BOX
-                    )
-                ),
+                ): number_spec_selector(SPEC_CHUNK_SECONDS),
                 vol.Required(
                     "max_window_seconds", default=profile.get("max_window_seconds", 300)
-                ): _IntegerNumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=1, max=300, step=1, mode=selector.NumberSelectorMode.BOX
-                    )
-                ),
+                ): number_spec_selector(SPEC_MAX_WINDOW_SECONDS),
                 vol.Optional(
                     CONF_FRIGATE_BASE_URL, default=profile.get(CONF_FRIGATE_BASE_URL) or ""
                 ): str,
@@ -734,11 +733,7 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                     default=profile.get(
                         CONF_EXPORT_DELAY_SECONDS, DEFAULT_EXPORT_DELAY_SECONDS
                     ),
-                ): _IntegerNumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=0, max=60, step=1, mode=selector.NumberSelectorMode.BOX
-                    )
-                ),
+                ): number_spec_selector(SPEC_EXPORT_DELAY_SECONDS),
                 vol.Optional(
                     "correlation_group", default=profile.get("correlation_group") or ""
                 ): str,
@@ -754,11 +749,11 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     "source_clock_offset_seconds",
                     default=float(profile.get("source_clock_offset_seconds", 0.0)),
-                ): vol.All(vol.Coerce(float), vol.Range(min=-3600.0, max=3600.0)),
+                ): number_spec_selector(SPEC_SOURCE_CLOCK_OFFSET_SECONDS, step=0.1),
                 vol.Optional(
                     "source_time_uncertainty_seconds",
                     default=float(profile.get("source_time_uncertainty_seconds", 0.0)),
-                ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=300.0)),
+                ): number_spec_selector(SPEC_SOURCE_TIME_UNCERTAINTY_SECONDS, step=0.1),
             }
         )
         return vol.Schema(schema)
@@ -846,7 +841,7 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         ):
             export_delay = int(export_delay)
         profile[CONF_EXPORT_DELAY_SECONDS] = (
-            export_delay if isinstance(export_delay, int) else DEFAULT_EXPORT_DELAY_SECONDS
+            export_delay if export_delay is not None else DEFAULT_EXPORT_DELAY_SECONDS
         )
 
         profile["hard_cap_behavior"] = "stop"
@@ -872,18 +867,20 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         raw_offset = user_input.get(
             "source_clock_offset_seconds", defaults.get("source_clock_offset_seconds", 0.0)
         )
-        try:
-            profile["source_clock_offset_seconds"] = max(-3600.0, min(3600.0, float(raw_offset)))
-        except (TypeError, ValueError):
-            profile["source_clock_offset_seconds"] = 0.0
+        profile["source_clock_offset_seconds"] = (
+            float(raw_offset)
+            if isinstance(raw_offset, (int, float)) and not isinstance(raw_offset, bool)
+            else raw_offset
+        )
 
         raw_unc = user_input.get(
             "source_time_uncertainty_seconds", defaults.get("source_time_uncertainty_seconds", 0.0)
         )
-        try:
-            profile["source_time_uncertainty_seconds"] = max(0.0, min(300.0, float(raw_unc)))
-        except (TypeError, ValueError):
-            profile["source_time_uncertainty_seconds"] = 0.0
+        profile["source_time_uncertainty_seconds"] = (
+            float(raw_unc)
+            if isinstance(raw_unc, (int, float)) and not isinstance(raw_unc, bool)
+            else raw_unc
+        )
 
         return profile
 

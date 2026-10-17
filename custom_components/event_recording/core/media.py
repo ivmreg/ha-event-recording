@@ -7,6 +7,7 @@ rejects URL fetches, and validates media assets with injected probes.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -18,6 +19,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+from .validation import ValidationError
 
 
 class MediaImportError(Exception):
@@ -32,7 +35,7 @@ class InvalidMediaError(MediaImportError):
     """Raised when media data fails container, stream, or codec validation."""
 
 
-class PathTraversalSecurityError(MediaImportError):
+class PathTraversalSecurityError(MediaImportError, ValidationError):
     """Raised when an import path violates containment boundaries or attempts URL fetch."""
 
 
@@ -232,7 +235,7 @@ def verify_media_path(path: str | Path, allowed_roots: Sequence[str | Path]) -> 
 
     if not contained:
         raise PathTraversalSecurityError(
-            f"Path '{resolved_path}' is not within any permitted media root: {allowed_roots}"
+            "Source path is not within any permitted media root"
         )
 
     if not resolved_path.is_file():
@@ -242,17 +245,25 @@ def verify_media_path(path: str | Path, allowed_roots: Sequence[str | Path]) -> 
 
 
 def stage_and_promote_media(
-    src_path: Path,
+    src_path: Path | str,
     owned_media_root: Path,
     event_id: str,
     media_id: str,
     extension: str,
+    adopt_staging: bool = False,
 ) -> tuple[str, int, str]:
     """Atomically stage and promote media asset into owned root.
 
-    Computes SHA-256 content hash in streaming chunks off-loop,
-    stages inside .staging directory, and atomically renames into final directory.
-    Validates identifiers against path traversal/control characters.
+    When adopt_staging is False (default for external imports), creates a duplicate
+    copy in .staging before atomic rename into destination, preserving the source untouched.
+
+    When adopt_staging is True (for internal closed/settled capture outputs):
+    - Validates that src_path is strictly within owned .staging and not a symlink.
+    - Computes SHA-256 and size in streaming chunks off-loop without writing duplicate bytes.
+    - Atomically moves src_path into the final destination directory via os.replace.
+    - Handles cross-device renames safely by copying to a temporary destination on the target
+      filesystem before atomic replace.
+
     Returns (root_relative_file_name, size_bytes, sha256_hex).
     """
     # Reject control or path components in event_id or media_id
@@ -261,14 +272,84 @@ def stage_and_promote_media(
             raise PathTraversalSecurityError(f"{name} cannot be empty")
         clean = val.strip()
         if any(c in clean for c in "/\\..\0\r\n\t") or not re.match(r"^[a-zA-Z0-9_-]+$", clean):
-            raise PathTraversalSecurityError(f"Invalid characters or traversal attempt in {name}: '{val}'")
+            raise PathTraversalSecurityError(f"Invalid characters or traversal attempt in {name}")
 
     clean_ext = extension if extension.startswith(".") else f".{extension}"
     owned_root = owned_media_root.resolve()
 
-    staging_dir = owned_root / ".staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    temp_target = staging_dir / f"{event_id}_{media_id}.tmp"
+    target_dir = (owned_root / event_id).resolve()
+    if not target_dir.is_relative_to(owned_root):
+        raise PathTraversalSecurityError(f"Target directory escapes owned root: {target_dir}")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    final_file_name = f"{media_id}{clean_ext}"
+    final_path = (target_dir / final_file_name).resolve()
+    if not final_path.is_relative_to(owned_root):
+        raise PathTraversalSecurityError(f"Target file escapes owned root: {final_path}")
+
+    staging_dir = owned_media_root / ".staging"
+    if staging_dir.is_symlink():
+        raise PathTraversalSecurityError("Cannot adopt media from symlinked staging directory")
+    resolved_staging = staging_dir.resolve()
+    if not resolved_staging.is_relative_to(owned_root):
+        raise PathTraversalSecurityError("Staging directory escapes owned root")
+    if Path(owned_media_root).is_symlink() and not owned_root.is_relative_to(Path(owned_media_root).parent.resolve()):
+        raise PathTraversalSecurityError("Owned media root symlink escapes intended root")
+    src_path = Path(src_path)
+
+    if adopt_staging:
+        # Enforce containment, non-symlink, and regular file invariant
+        if src_path.is_symlink():
+            raise PathTraversalSecurityError("Cannot adopt symlinked staging file")
+        resolved_src = src_path.resolve()
+        if resolved_src.parent != resolved_staging or resolved_src == resolved_staging:
+            raise PathTraversalSecurityError(
+                "Cannot adopt media outside owned .staging directory"
+            )
+        if not resolved_src.is_file():
+            raise FileNotFoundError("Staging file not found for adoption")
+
+        # Stream hash calculation directly from settled staging file (zero duplicate write)
+        hasher = hashlib.sha256()
+        size_bytes = 0
+        with open(resolved_src, "rb") as f_in:
+            while chunk := f_in.read(65536):
+                hasher.update(chunk)
+                size_bytes += len(chunk)
+
+        # Atomic move into final path (same-filesystem zero-copy rename)
+        try:
+            os.replace(resolved_src, final_path)
+        except OSError as err:
+            is_cross_dev = (
+                getattr(err, "errno", None) == errno.EXDEV
+                or getattr(err, "winerror", None) == 17
+            )
+            if is_cross_dev:
+                temp_dest = target_dir / f"{media_id}.tmp"
+                try:
+                    shutil.copyfile(resolved_src, temp_dest)
+                    os.replace(temp_dest, final_path)
+                    try:
+                        resolved_src.unlink()
+                    except OSError:
+                        final_path.unlink(missing_ok=True)
+                        raise
+                finally:
+                    if temp_dest.exists():
+                        try:
+                            temp_dest.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+            else:
+                raise
+
+        rel_path = f"{event_id}/{final_file_name}"
+        return rel_path, size_bytes, hasher.hexdigest()
+
+    # External import path (adopt_staging=False): preserve source untouched
+    resolved_staging.mkdir(parents=True, exist_ok=True)
+    temp_target = resolved_staging / f"{event_id}_{media_id}.tmp"
 
     hasher = hashlib.sha256()
     size_bytes = 0
@@ -280,17 +361,6 @@ def stage_and_promote_media(
                 f_out.write(chunk)
                 size_bytes += len(chunk)
 
-        target_dir = (owned_root / event_id).resolve()
-        if not target_dir.is_relative_to(owned_root):
-            raise PathTraversalSecurityError(f"Target directory escapes owned root: {target_dir}")
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        final_file_name = f"{media_id}{clean_ext}"
-        final_path = (target_dir / final_file_name).resolve()
-        if not final_path.is_relative_to(owned_root):
-            raise PathTraversalSecurityError(f"Target file escapes owned root: {final_path}")
-
-        # Atomic move into destination
         os.replace(temp_target, final_path)
     finally:
         if temp_target.exists():
@@ -299,7 +369,6 @@ def stage_and_promote_media(
             except Exception:
                 pass
 
-    # Relative path inside owned media root (e.g. "event_123/media_abc.mp4")
     rel_path = f"{event_id}/{final_file_name}"
     return rel_path, size_bytes, hasher.hexdigest()
 

@@ -213,6 +213,10 @@ class RecorderRegistry:
                     res_id,
                 )
 
+        if stg is None and not sidecars:
+            _on_cleaned(True)
+            return
+
         try:
             loop = asyncio.get_running_loop()
             fut = loop.run_in_executor(None, _do_unlink)

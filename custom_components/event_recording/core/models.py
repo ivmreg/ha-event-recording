@@ -8,10 +8,17 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from .validation import (  # noqa: F401
+    validate_bounded_string,
+    validate_correlation_id,
+    validate_finite_number,
+    validate_payload_json,
+    validate_safe_id,
+)
 
 
 def utc_now() -> datetime:
@@ -50,80 +57,6 @@ def sanitize_capture_error(error_code: Any) -> str | None:
     clean = "".join(c for c in raw if c.isalnum() or c in ("_", "-")).upper()
     return clean[:64] if clean else "INTERNAL_ERROR"
 
-
-def validate_bounded_string(
-    val: Any,
-    name: str,
-    max_len: int = 255,
-    allow_none: bool = False,
-) -> str | None:
-    """Validate a bounded non-sensitive string without control characters."""
-    if val is None:
-        if allow_none:
-            return None
-        raise ValueError(f"{name} cannot be None")
-    if not isinstance(val, str):
-        raise ValueError(f"{name} must be a string, got {type(val).__name__}")
-    clean = val.strip()
-    if not clean and not allow_none:
-        raise ValueError(f"{name} cannot be empty")
-    if len(clean) > max_len:
-        raise ValueError(f"{name} exceeds maximum length of {max_len}")
-    if any(c in clean for c in "\0\r\n"):
-        raise ValueError(f"{name} contains prohibited control characters")
-    return clean
-
-
-def validate_finite_number(
-    val: Any,
-    name: str,
-    min_val: float = 0.0,
-    allow_zero: bool = True,
-) -> float:
-    """Validate a finite, non-NaN positive float or int."""
-    if isinstance(val, bool) or not isinstance(val, (int, float)):
-        raise ValueError(f"{name} must be a number, got {type(val).__name__}")
-    num = float(val)
-    if not math.isfinite(num):
-        raise ValueError(f"{name} must be finite (got {val})")
-    if allow_zero:
-        if num < min_val:
-            raise ValueError(f"{name} must be >= {min_val}, got {num}")
-    else:
-        if num <= min_val:
-            raise ValueError(f"{name} must be > {min_val}, got {num}")
-    return num
-
-
-def validate_payload_json(
-    payload: Any,
-    name: str = "payload",
-    max_bytes: int = 131072,
-) -> dict[str, Any]:
-    """Validate JSON payload dictionary and reject NaN, inf, or oversized blobs."""
-    if payload is None:
-        return {}
-    if not isinstance(payload, dict):
-        raise ValueError(f"{name} must be a dictionary, got {type(payload).__name__}")
-    try:
-        dumped = json.dumps(payload, allow_nan=False)
-    except (ValueError, TypeError) as err:
-        raise ValueError(f"{name} cannot be serialized to valid finite JSON: {err}") from err
-    if len(dumped.encode("utf-8")) > max_bytes:
-        raise ValueError(f"{name} exceeds maximum JSON size of {max_bytes} bytes")
-    return payload
-
-
-def validate_safe_id(val: Any, name: str = "id") -> str:
-    """Validate safe internal/external identifier rejecting path components and control chars."""
-    if not isinstance(val, str):
-        raise ValueError(f"{name} must be a string, got {type(val).__name__}")
-    clean = val.strip()
-    if not clean or len(clean) > 64:
-        raise ValueError(f"{name} must be 1-64 characters")
-    if any(c in clean for c in "/\\..\0\r\n\t") or not re.match(r"^[a-zA-Z0-9_-]+$", clean):
-        raise ValueError(f"Invalid characters or path traversal attempt in {name}: '{val}'")
-    return clean
 
 
 def validate_timing_metadata(
@@ -410,22 +343,6 @@ def to_public_dto(event: RecordedEvent, *, omit_correlation: bool = False) -> di
     if not omit_correlation and event.correlation_id is not None:
         res["correlation_id"] = event.correlation_id
     return res
-
-
-def validate_correlation_id(val: Any) -> str | None:
-    """Validate optional correlation ID string (up to 64 chars, safe characters)."""
-    if val is None:
-        return None
-    if not isinstance(val, str):
-        raise ValueError(f"correlation_id must be a string, got {type(val).__name__}")
-    clean = val.strip()
-    if not clean:
-        return None
-    if len(clean) > 64:
-        raise ValueError(f"correlation_id exceeds maximum length of 64: '{clean[:10]}...'")
-    if not re.match(r"^[a-zA-Z0-9_\-.:]+$", clean):
-        raise ValueError(f"Invalid characters in correlation_id: '{val}'")
-    return clean
 
 
 @dataclass(frozen=True)
