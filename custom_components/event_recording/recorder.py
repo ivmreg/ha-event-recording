@@ -425,7 +425,7 @@ class RecorderRegistry:
 
 
 class CameraRecorderAdapter:
-    """Invokes native Home Assistant camera.record service off the event loop.
+    """Captures camera recordings from Home Assistant's shared HLS stream.
 
     Enforces path containment, fail-closed quarantine on timeout/cancellation,
     and safe serialization across stream aliases sharing physical camera feeds.
@@ -450,7 +450,7 @@ class CameraRecorderAdapter:
         ownership_group: str | None = None,
         lock_timeout_seconds: float = 15.0,
     ) -> None:
-        """Execute a single camera.record chunk with quarantine and alias coordination."""
+        """Capture one stream chunk with quarantine and alias coordination."""
         resolved_path = await self.hass.async_add_executor_job(Path(target_path).resolve)
         await self.hass.async_add_executor_job(
             lambda: resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -474,20 +474,16 @@ class CameraRecorderAdapter:
         async with self.registry.acquire_locks(
             camera_entity, ownership_group, timeout_seconds=lock_timeout_seconds
         ):
-            service_data: dict[str, Any] = {
-                "entity_id": camera_entity,
-                "filename": str(resolved_path),
-                "duration": int(duration_seconds),
-            }
-            if lookback_seconds > 0:
-                service_data["lookback"] = int(lookback_seconds)
+            from .stream_capture import async_record_stream
 
             record_task = asyncio.create_task(
-                self.hass.services.async_call(
-                    "camera",
-                    "record",
-                    service_data,
-                    blocking=True,
+                async_record_stream(
+                    hass=self.hass,
+                    camera_entity=camera_entity,
+                    target_path=resolved_path,
+                    duration_seconds=duration_seconds,
+                    lookback_seconds=lookback_seconds,
+                    watchdog_padding_seconds=self.padding,
                 )
             )
 

@@ -16,8 +16,9 @@ This document describes operational limitations and architectural boundaries of 
 - **Best-Effort Lookback**: Native Home Assistant lookback may reuse an already active HLS buffer, but cannot guarantee pre-trigger footage; cold streams may yield none. An external retained-video provider such as Frigate is optional, and no NVR is required.
 
 ## 3. Chunk Handoff Coverage & Timing Metadata
-- **Best-Effort Segments**: Native chunk handoff coverage depends on Home Assistant and stream keyframe timing. Coverage is best effort and has not been measured as gapless.
-- **Native Lookback/Chunk Boundary Timing**: Boundary timing metadata remains `"unknown"` or `"estimated"` without an NVR provider; native `camera.record` provides no verified PTS timestamps.
+- **Best-Effort Segments & Source Media Bounds**: Native chunk handoff coverage depends on Home Assistant and stream keyframe timing. Coverage is best effort and has not been measured as gapless. Recording duration reflects actual received stream segment duration, with no wall-clock-duration promise beyond source media.
+- **Monotonic DTS Normalization**: An integration-owned stream remuxer normalizes DTS per stream to strictly monotonically increasing order to prevent MP4 container aborts (`[mp4] Application provided invalid, non monotonically increasing dts to muxer`). While this remedies mux failures and preserves B-frame composition offsets and A/V alignment, it cannot promise damaged camera source timing is physically faithful if the encoder emitted duplicate timestamps. Packets with absent timestamps fail explicitly rather than inventing artificial clocks.
+- **Native Lookback/Chunk Boundary Timing**: Boundary timing metadata remains `"unknown"` or `"estimated"` without an NVR provider; native camera streams provide no verified PTS timestamps.
 
 ## 4. Snapshot Recording Mode
 - **Still Images Only**: Native snapshot mode captures single static images (`image/jpeg` or `image/png`) upon trigger activation. It does not record video clips or animated sequences.
