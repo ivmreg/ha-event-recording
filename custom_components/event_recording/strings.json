@@ -26,20 +26,39 @@
     "step": {
       "init": {
         "title": "Event Recording Options",
-        "description": "Manage storage settings and optional camera recording defaults.",
+        "description": "Manage storage settings, recording concurrency, and optional camera recording defaults.\n\nKnown Limitations:\n- Native lookback may reuse an active HLS buffer, but is best effort; cold streams may have no pre-roll. An external retained-video provider (for example Frigate) is optional.\n- Snapshot mode captures still images only.\n- Storage capacity admission failures return STORAGE_CAPACITY_EXCEEDED; only writers unsettled after timeout or cancellation are quarantined.\n- event.start_at is the logical requested-window start (occurred_at minus requested lookback), not intake time or verified image UTC.\n- This integration serializes its own writers; unrelated camera.record callers can still collide.\n- Storage-root migration UI and grouped-card timeline presentation are deferred.",
         "menu_options": {
-          "recording_settings": "Storage and recording settings",
-          "cameras": "Camera profiles"
+          "recording_settings": "Recording Concurrency & Queue",
+          "storage_settings": "Storage & Retention Limits",
+          "cameras": "Camera Profiles",
+          "effective_config": "Effective Configuration Summary"
         }
       },
       "recording_settings": {
-        "title": "Storage and Recording Settings",
-        "description": "Update global retention budgets and chunk parameters.",
+        "title": "Recording Concurrency & Queue",
+        "description": "Configure worker concurrency, queue capacity, and chunk segment duration.",
         "data": {
-          "retention_size_mb": "Maximum Storage Budget (MB)",
-          "retention_days": "Retention Duration (Days)",
-          "chunk_seconds": "Recording Chunk Duration (Seconds, max 15)"
+          "chunk_seconds": "Recording Chunk Duration (seconds, best-effort chained, max 15)",
+          "max_parallel_resources": "Maximum Concurrent Recordings (1-8)",
+          "max_queue_depth": "Maximum Queue Depth (1-256)",
+          "queue_wait_timeout_seconds": "Queue Wait Timeout (seconds)",
+          "enable_auto_association": "Enable Cross-Camera Auto-Association (Default OFF)",
+          "auto_association_tolerance_seconds": "Auto-Association Time Tolerance (seconds, 1.0-60.0)",
+          "max_incident_span_seconds": "Maximum Incident Span (seconds, 10.0-3600.0)"
         }
+      },
+      "storage_settings": {
+        "title": "Storage & Retention Limits",
+        "description": "Configure media retention budgets and minimum free disk space safeguards.",
+        "data": {
+          "retention_size_mb": "Maximum Storage Budget (MB, min 50)",
+          "retention_days": "Retention Duration (Days, min 1)",
+          "min_disk_free_mb": "Minimum Free Disk Space (MB, floor 50)"
+        }
+      },
+      "effective_config": {
+        "title": "Effective Configuration Summary",
+        "description": "Current effective operational settings:\n\n- Configuration Precedence: {precedence}\n- Resolved Storage Root: {media_root}\n- Estimated Byte Rate: {rate_estimate}\n- Watchdog Timeout Formula: {watchdog_formula}\n- Hard Cap Safeguard: {hard_cap_behavior}\n- Chunk Duration: {chunk_seconds}s\n- Concurrency Limit: {max_parallel}\n- Queue Capacity: {max_queue_depth} (timeout: {queue_timeout}s)\n- Retention: {retention_size_mb} MB / {retention_days} days\n- Disk Free Floor: {min_disk_free_mb} MB\n- Configured Camera Profiles: {profiles_count}\n- Auto-Association: {auto_association}\n\nKnown Limitations:\n- Native lookback may reuse an active HLS buffer; best effort only\n- Snapshot mode stores static still images only\n- Storage admission failures return STORAGE_CAPACITY_EXCEEDED; only unsettled timed-out/cancelled writers are quarantined\n- Visual UTC timestamps may remain unknown without calibrated provider clocks\n- Storage root migration UI and grouped-card display deferred"
       },
       "cameras": {
         "title": "Camera Profiles",
@@ -53,57 +72,94 @@
       "camera_add": {
         "title": "Add Camera Profile",
         "description": "Choose a configured Home Assistant camera. Credentials remain managed by its camera integration.",
-        "data": {"camera_entity": "Camera"}
+        "data": {
+          "camera_entity": "Camera"
+        }
       },
       "camera_add_profile": {
         "title": "Set Camera Defaults",
-        "description": "Set defaults for {camera_name}. Lookback needs stream preload or buffering enabled in the camera integration.",
+        "description": "Set defaults for {camera_name}. Lookback may reuse an active HLS buffer, but is best effort; cold streams may have no pre-roll.",
         "data": {
           "source_id": "Source ID",
           "label": "Display Name",
+          "recording_mode": "Recording Capture Mode",
+          "ownership_group": "Stream Ownership Group (Optional)",
           "window_seconds": "Default Recording Window (seconds)",
           "lookback_seconds": "Lookback (seconds)",
           "chunk_seconds": "Recording Chunk Duration (seconds)",
-          "max_window_seconds": "Maximum Recording Window (seconds)"
+          "max_window_seconds": "Maximum Recording Window (seconds)",
+          "frigate_base_url": "Frigate NVR Base URL (Buffered mode)",
+          "frigate_camera_name": "Frigate Camera Name",
+          "frigate_auth_token": "Frigate API Token (Optional)",
+          "export_delay_seconds": "Post-Trigger Export Delay (seconds)",
+          "correlation_group": "Correlation Group (Optional)",
+          "zone": "Physical Zone (Optional)",
+          "adjacent_zones": "Adjacent Zones (Optional, comma-separated)",
+          "source_clock_offset_seconds": "Source Clock Offset (seconds, -3600 to 3600)",
+          "source_time_uncertainty_seconds": "Source Time Uncertainty (seconds, 0 to 300)"
         },
         "data_description": {
           "source_id": "Stable identifier used to group this camera's events in the timeline.",
+          "recording_mode": "Capture mode: extend (continuous chunked), native_fixed (single clip), native_snapshot (still image), or buffered (provider export).",
+          "ownership_group": "Optional group identifier for cameras sharing the same physical stream to prevent parallel stream concurrency.",
           "window_seconds": "The default duration requested when an automation records this camera.",
           "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments.",
-          "max_window_seconds": "Longest recording window allowed for this camera."
+          "max_window_seconds": "Longest recording window allowed for this camera.",
+          "frigate_base_url": "HTTP or HTTPS base URL of Frigate NVR (e.g. http://frigate.local:5000). Never defaults to localhost.",
+          "frigate_camera_name": "Camera identifier defined in Frigate configuration.",
+          "frigate_auth_token": "Optional bearer authentication token for Frigate API.",
+          "export_delay_seconds": "Seconds to wait after event end before requesting exported clip to ensure NVR segment availability."
         }
       },
       "camera_edit": {
         "title": "Choose Camera Profile to Edit",
-        "data": {"camera_entity": "Camera Profile"}
+        "data": {
+          "camera_entity": "Camera Profile"
+        }
       },
       "camera_edit_profile": {
         "title": "Edit Camera Profile",
-        "description": "Lookback needs stream preload or buffering enabled in the camera integration.",
+        "description": "Lookback may reuse an active HLS buffer, but is best effort; cold streams may have no pre-roll.",
         "data": {
           "camera_entity": "Camera",
           "source_id": "Source ID",
           "label": "Display Name",
+          "recording_mode": "Recording Capture Mode",
+          "ownership_group": "Stream Ownership Group (Optional)",
           "window_seconds": "Default Recording Window (seconds)",
           "lookback_seconds": "Lookback (seconds)",
           "chunk_seconds": "Recording Chunk Duration (seconds)",
-          "max_window_seconds": "Maximum Recording Window (seconds)"
+          "max_window_seconds": "Maximum Recording Window (seconds)",
+          "frigate_base_url": "Frigate NVR Base URL (Buffered mode)",
+          "frigate_camera_name": "Frigate Camera Name",
+          "frigate_auth_token": "Frigate API Token (Optional)",
+          "export_delay_seconds": "Post-Trigger Export Delay (seconds)"
         },
         "data_description": {
           "source_id": "Stable identifier used to group this camera's events in the timeline.",
+          "recording_mode": "Capture mode: extend (continuous chunked), native_fixed (single clip), native_snapshot (still image), or buffered (provider export).",
+          "ownership_group": "Optional group identifier for cameras sharing the same physical stream to prevent parallel stream concurrency.",
           "window_seconds": "The default duration requested when an automation records this camera.",
           "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments.",
-          "max_window_seconds": "Longest recording window allowed for this camera."
+          "max_window_seconds": "Longest recording window allowed for this camera.",
+          "frigate_base_url": "HTTP or HTTPS base URL of Frigate NVR (e.g. http://frigate.local:5000). Never defaults to localhost.",
+          "frigate_camera_name": "Camera identifier defined in Frigate configuration.",
+          "frigate_auth_token": "Optional bearer authentication token for Frigate API.",
+          "export_delay_seconds": "Seconds to wait after event end before requesting exported clip to ensure NVR segment availability."
         }
       },
       "camera_remove": {
         "title": "Choose Camera Profile to Remove",
-        "data": {"camera_entity": "Camera Profile"}
+        "data": {
+          "camera_entity": "Camera Profile"
+        }
       },
       "camera_remove_confirm": {
         "title": "Remove Camera Profile",
         "description": "Remove the profile for {camera_name} ({camera_entity})? Existing journal events and recordings will be kept.",
-        "data": {"confirm": "Remove this camera profile"}
+        "data": {
+          "confirm": "Remove this camera profile"
+        }
       }
     },
     "error": {
@@ -118,7 +174,18 @@
       "invalid_lookback_seconds": "Lookback must be a whole number from 0 to 60 seconds.",
       "invalid_chunk_seconds": "Chunk duration must be a whole number from 1 to 15 seconds.",
       "invalid_max_window_seconds": "Maximum window must be a whole number from 1 to 300 seconds.",
-      "max_window_below_window": "Maximum recording window must be at least the default recording window."
+      "max_window_below_window": "Maximum recording window must be at least the default recording window.",
+      "invalid_recording_mode": "Recording mode must be extend, native_fixed, native_snapshot, or buffered.",
+      "invalid_ownership_group": "Ownership group identifier must not exceed 64 characters and cannot contain control characters.",
+      "invalid_max_queue_depth": "Queue depth must be a whole number from 1 to 256.",
+      "invalid_max_parallel": "Max parallel recordings must be between 1 and 8.",
+      "invalid_queue_timeout": "Queue wait timeout must be between 1 and 300 seconds.",
+      "min_disk_free_too_low": "Minimum free disk space must be at least 50 MB.",
+      "retention_size_too_low": "Retention size must be at least 50 MB.",
+      "retention_days_too_low": "Retention days must be at least 1 day.",
+      "invalid_frigate_base_url": "Frigate base URL must start with http:// or https://.",
+      "invalid_frigate_camera_name": "Frigate camera name must contain only alphanumeric characters, underscores, and hyphens.",
+      "invalid_export_delay_seconds": "Export delay must be a whole number from 0 to 60 seconds."
     },
     "abort": {
       "remove_cancelled": "Camera profile removal was cancelled.",

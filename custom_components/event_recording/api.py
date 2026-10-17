@@ -9,12 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from homeassistant.core import HomeAssistant
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
 
 from .const import DATA_API, DOMAIN
-from .core.models import MediaItem, RecordedEvent
+from .core.models import Incident, IncidentInputs, MediaItem, RecordedEvent
 from .core.store import JournalStore
 
 
@@ -24,12 +25,14 @@ class ConsumerRegistration:
     def __init__(
         self,
         consumer_id: str,
-        retry_callback: Callable[[str], Awaitable[bool]],
+        retry_callback: Callable[[str], Awaitable[bool]] | None = None,
         available: bool = True,
+        is_busy: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.id = consumer_id
         self.retry_callback = retry_callback
         self.available = available
+        self.is_busy = is_busy
 
 
 class RecordingAPI:
@@ -100,11 +103,13 @@ class RecordingAPI:
     def register_consumer(
         self,
         consumer_id: str,
-        retry_callback: Callable[[str], Awaitable[bool]],
+        retry_callback: Callable[[str], Awaitable[bool]] | None = None,
         available: bool = True,
+        *,
+        is_busy: Callable[[], Awaitable[bool]] | None = None,
     ) -> Callable[[], None]:
-        """Register an external consumer for capabilities and retry delegation."""
-        reg = ConsumerRegistration(consumer_id, retry_callback, available)
+        """Register an external consumer for capabilities, retry delegation, and busy reporting."""
+        reg = ConsumerRegistration(consumer_id, retry_callback, available, is_busy=is_busy)
         self._consumers[consumer_id] = reg
 
         def _unsubscribe() -> None:
@@ -114,13 +119,42 @@ class RecordingAPI:
 
         return _unsubscribe
 
+    async def is_consumer_busy(self, consumer_id: str) -> bool:
+        """Return whether the registered consumer is currently busy processing jobs.
+
+        Fails closed (returns True) if the consumer is unknown, has no is_busy callback,
+        or if the is_busy callback raises an exception.
+        """
+        consumer = self._consumers.get(consumer_id)
+        if not consumer or not consumer.is_busy:
+            return True
+        try:
+            return await consumer.is_busy()
+        except Exception:
+            return True
+
+    async def are_any_consumers_busy(self) -> bool:
+        """Check all registered consumers; return True if any consumer reports busy or fails closed.
+
+        Fails closed (returns True) if any consumer lacks an is_busy callback or raises an error.
+        """
+        for consumer in self._consumers.values():
+            if not consumer.is_busy:
+                return True
+            try:
+                if await consumer.is_busy():
+                    return True
+            except Exception:
+                return True
+        return False
+
     def get_registered_consumers(self) -> list[dict[str, Any]]:
         """Return list of registered consumers for WebSocket capabilities reporting."""
         return [
             {
                 "id": c.id,
                 "available": c.available,
-                "can_retry": True,
+                "can_retry": c.retry_callback is not None,
             }
             for c in self._consumers.values()
         ]
@@ -128,12 +162,80 @@ class RecordingAPI:
     async def trigger_consumer_retry(self, consumer_id: str, event_id: str) -> bool:
         """Trigger registered consumer retry callback."""
         consumer = self._consumers.get(consumer_id)
-        if not consumer or not consumer.available:
+        if not consumer or not consumer.available or not consumer.retry_callback:
             return False
         try:
             return await consumer.retry_callback(event_id)
         except Exception:
             return False
+
+    # -------------------------------------------------------------------------
+    # Incident Methods Delegation
+    # -------------------------------------------------------------------------
+
+    async def get_incident(self, incident_id: str) -> Incident | None:
+        """Async delegate to store.get_incident."""
+        return await self._store.get_incident(incident_id)
+
+    async def get_incident_inputs(
+        self, incident_id: str, input_namespace: str
+    ) -> IncidentInputs | None:
+        """Async delegate to store.get_incident_inputs with canonical input token generation."""
+        return await self._store.get_incident_inputs(incident_id, input_namespace)
+
+    async def list_event_incidents(self, event_id: str) -> list[Incident]:
+        """Async delegate to store.list_event_incidents."""
+        return await self._store.list_event_incidents(event_id)
+
+    async def get_incident_events(self, incident_id: str) -> list[RecordedEvent]:
+        """Trusted internal delegate to store.get_incident_events."""
+        return await self._store.get_incident_events(incident_id)
+
+    async def reserve_incident_annotation(
+        self,
+        incident_id: str,
+        namespace: str,
+        expected_input_token: str,
+        input_namespace: str,
+        profile_digest: str,
+        worker_id: str | None = None,
+        ttl_seconds: float = 60.0,
+    ) -> int | None:
+        """Reserve an incident annotation slot with transactional CAS comparing fresh input token."""
+        return await self._store.reserve_incident_annotation(
+            incident_id,
+            namespace,
+            expected_input_token,
+            input_namespace,
+            profile_digest=profile_digest,
+            worker_id=worker_id,
+            ttl_seconds=ttl_seconds,
+        )
+
+    async def set_incident_annotation_cas(
+        self,
+        incident_id: str,
+        namespace: str,
+        payload: dict[str, Any],
+        expected_generation: int,
+        expected_input_token: str,
+        profile_digest: str,
+    ) -> bool:
+        """Commit incident annotation result with transactional CAS comparing fresh input token."""
+        return await self._store.set_incident_annotation_cas(
+            incident_id,
+            namespace,
+            payload,
+            expected_generation,
+            expected_input_token,
+            profile_digest=profile_digest,
+        )
+
+    def subscribe_incidents(
+        self, callback: Callable[[str, int], None]
+    ) -> Callable[[], None]:
+        """Subscribe to post-commit incident revision updates."""
+        return self._store.subscribe_incidents(callback)
 
     @property
     def ffmpeg_binary(self) -> str | None:

@@ -24,11 +24,13 @@ from .const import (
     DOMAIN,
     WS_TYPE_EVENT,
     WS_TYPE_EVENTS,
+    WS_TYPE_INCIDENT,
+    WS_TYPE_LIST_ACTIVITY,
     WS_TYPE_MEDIA,
     WS_TYPE_PROCESS,
     WS_TYPE_SUBSCRIBE,
 )
-from .core.models import RecordedEvent, format_iso, to_public_dto, utc_now
+from .core.models import RecordedEvent, format_iso, to_public_dto, to_public_incident_dto, utc_now
 from .core.store import JournalStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -82,6 +84,8 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_handle_subscribe)
     websocket_api.async_register_command(hass, ws_handle_media)
     websocket_api.async_register_command(hass, ws_handle_process)
+    websocket_api.async_register_command(hass, ws_handle_incident)
+    websocket_api.async_register_command(hass, ws_handle_list_activity)
 
 
 # -----------------------------------------------------------------------------
@@ -230,7 +234,25 @@ async def ws_handle_event(
         connection.send_error(msg["id"], "unauthorized", "Access denied")
         return
 
-    connection.send_result(msg["id"], {"event": to_public_dto(event)})
+    # Check incident membership: authorize EVERY member before summary/metadata
+    event_incidents = await store.list_event_incidents(event_id)
+    authorized_incidents: list[dict[str, Any]] = []
+    has_unauthorized_member = False
+    for inc in event_incidents:
+        members = await store.get_incident_events(inc.incident_id)
+        if all(is_user_authorized_for_event(connection.user, m) for m in members):
+            authorized_incidents.append(to_public_incident_dto(inc))
+        else:
+            has_unauthorized_member = True
+
+    event_dto = to_public_dto(
+        event,
+        omit_correlation=has_unauthorized_member and not authorized_incidents,
+    )
+    if authorized_incidents:
+        event_dto["incidents"] = authorized_incidents
+
+    connection.send_result(msg["id"], {"event": event_dto})
 
 
 # -----------------------------------------------------------------------------
@@ -476,3 +498,274 @@ async def ws_handle_process(
 
     accepted = await api.trigger_consumer_retry(consumer_id, event_id)
     connection.send_result(msg["id"], {"accepted": bool(accepted)})
+
+
+# -----------------------------------------------------------------------------
+# 6. event_recording/incident
+# -----------------------------------------------------------------------------
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_INCIDENT,
+        vol.Required("incident_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_handle_incident(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Handle retrieving a single incident with strict all-or-nothing member authorization."""
+    if (
+        not connection.user
+        or connection.user.system_generated
+        or not getattr(connection.user, "is_active", True)
+    ):
+        connection.send_error(msg["id"], "unauthorized", "Active user authentication required")
+        return
+
+    domain_data = hass.data.get(DOMAIN, {})
+    store: JournalStore | None = domain_data.get(DATA_STORE)
+    if not store:
+        connection.send_error(msg["id"], "not_found", "Event Recording is not initialized")
+        return
+
+    incident_id = msg["incident_id"]
+    incident = await store.get_incident(incident_id)
+    if not incident:
+        connection.send_error(msg["id"], "not_found", f"Incident '{incident_id}' not found")
+        return
+
+    members = await store.get_incident_events(incident_id)
+    # Authorize EVERY member before returning incident details. Safest omit if any member hidden!
+    for m in members:
+        if not is_user_authorized_for_event(connection.user, m):
+            connection.send_error(msg["id"], "unauthorized", "Access denied")
+            return
+
+    connection.send_result(
+        msg["id"],
+        {
+            "incident": to_public_incident_dto(incident),
+            "events": [to_public_dto(m) for m in members],
+        },
+    )
+
+
+# -----------------------------------------------------------------------------
+# 7. event_recording/list_activity
+# -----------------------------------------------------------------------------
+def _matches_activity_exclusion(
+    ann_dict: dict[str, Any],
+    exclusion: dict[str, Any],
+    event_media_revision: int | None = None,
+) -> bool:
+    """Return True if annotation payload equals the excluded value and media revision is fresh."""
+    ns = exclusion["namespace"]
+    field = exclusion["field"]
+    expected = exclusion["equals"]
+    ann = ann_dict.get(ns)
+    if not isinstance(ann, dict):
+        return False
+    if ann.get("status") != "complete":
+        return False
+    # Verify annotation.media_revision == event.media_revision so stale false doesn't hide new media
+    if event_media_revision is not None:
+        ann_media_rev = ann.get("media_revision", ann.get("expected_media_revision"))
+        if ann_media_rev is not None and ann_media_rev != event_media_revision:
+            return False
+    payload = ann.get("payload")
+    if not isinstance(payload, dict):
+        payload = {
+            k: v
+            for k, v in ann.items()
+            if k not in ("worker_id", "reserved_by", "reserved_until")
+        }
+    return payload.get(field) == expected
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_LIST_ACTIVITY,
+        vol.Optional("source_id"): str,
+        vol.Optional("kind"): str,
+        vol.Optional("exclude_current_complete_annotation"): _validate_annotation_exclusion,
+        vol.Optional("exclude_journal_only"): bool,
+        vol.Optional("group_by_incident", default=False): bool,
+        vol.Optional("limit", default=50): vol.All(vol.Coerce(int), vol.Range(min=1, max=100)),
+        vol.Optional("before_cursor"): str,
+        vol.Optional("cursor"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_handle_list_activity(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Handle listing activity feed with optional incident grouping and keyset pagination."""
+    if (
+        not connection.user
+        or connection.user.system_generated
+        or not getattr(connection.user, "is_active", True)
+    ):
+        connection.send_error(msg["id"], "unauthorized", "Active user authentication required")
+        return
+
+    domain_data = hass.data.get(DOMAIN, {})
+    store: JournalStore | None = domain_data.get(DATA_STORE)
+    if not store:
+        connection.send_error(msg["id"], "not_found", "Event Recording is not initialized")
+        return
+
+    api = get_api(hass)
+    limit = max(1, min(int(msg.get("limit", 50)), 100))
+    cursor = msg.get("before_cursor") or msg.get("cursor")
+    group_by_incident = bool(msg.get("group_by_incident", False))
+
+    source_id_filter = msg.get("source_id")
+    kind_filter = msg.get("kind")
+    exclude_journal_only = msg.get("exclude_journal_only") is True
+    annotation_exclusion = msg.get("exclude_current_complete_annotation")
+
+    def _event_passes_filters(ev: RecordedEvent) -> bool:
+        if source_id_filter and ev.source_id != source_id_filter:
+            return False
+        if kind_filter and ev.kind != kind_filter:
+            return False
+        if exclude_journal_only and not any(m.available for m in ev.media):
+            return False
+        if annotation_exclusion and _matches_activity_exclusion(
+            ev.annotations, annotation_exclusion, ev.media_revision
+        ):
+            return False
+        return True
+
+    def _incident_passes_filters(members: list[RecordedEvent]) -> bool:
+        if source_id_filter and not any(m.source_id == source_id_filter for m in members):
+            return False
+        if kind_filter and not any(m.kind == kind_filter for m in members):
+            return False
+        if exclude_journal_only and not any(
+            any(media.available for media in m.media) for m in members
+        ):
+            return False
+        if annotation_exclusion:
+            # All known inactive group may hide, any member known active (or unknown) keeps group
+            # If ANY member is unknown (no annotation or not complete) or active (does not match exclusion),
+            # the group is KEPT. Only hide if EVERY member has a complete annotation on current media_revision
+            # that matches the exclusion!
+            if len(members) > 0 and all(
+                _matches_activity_exclusion(m.annotations, annotation_exclusion, m.media_revision)
+                for m in members
+            ):
+                return False
+        return True
+
+    output_items: list[dict[str, Any]] = []
+    current_cursor = cursor
+    next_cursor: str | None = None
+    max_scan_batches = 500  # Unbounded semantic progress (safety bound against infinite loop)
+    batch_size = max(limit * 2, 50)
+    incident_authorized_cache: dict[str, bool] = {}
+
+    for _ in range(max_scan_batches):
+        batch, batch_next_cur = await store.list_activity(
+            group_by_incident=group_by_incident,
+            limit=batch_size,
+            cursor=current_cursor,
+        )
+        if not batch:
+            next_cursor = None
+            break
+
+        stopped_early = False
+        for item in batch:
+            itype = item["type"]
+            item_accepted = False
+
+            if itype == "incident":
+                inc = item["incident"]
+                members = item["members"]
+                iid = inc.incident_id
+                authorized_members = [
+                    m for m in members if is_user_authorized_for_event(connection.user, m)
+                ]
+                is_authorized = len(authorized_members) == len(members)
+                incident_authorized_cache[iid] = is_authorized
+
+                if is_authorized:
+                    if _incident_passes_filters(members):
+                        output_items.append(
+                            {
+                                "type": "incident",
+                                "incident": to_public_incident_dto(inc),
+                                "events": [to_public_dto(m) for m in members],
+                            }
+                        )
+                        item_accepted = True
+                # If NOT authorized, omit the whole incident!
+                # Its visible members will be projected as independent events at their own immutable start_at anchors.
+
+            else:
+                ev = item["event"]
+                if is_user_authorized_for_event(connection.user, ev):
+                    # Check if this event belongs to an authorized incident
+                    inc_ids = item.get("incident_ids") or []
+                    belongs_to_authorized_incident = False
+                    if group_by_incident and inc_ids:
+                        for inc_id in inc_ids:
+                            if inc_id not in incident_authorized_cache:
+                                inc_members = await store.get_incident_events(inc_id)
+                                incident_authorized_cache[inc_id] = all(
+                                    is_user_authorized_for_event(connection.user, m)
+                                    for m in inc_members
+                                )
+                            if incident_authorized_cache[inc_id]:
+                                belongs_to_authorized_incident = True
+                                break
+
+                    # If the event belongs to an authorized incident, it is matched to that incident;
+                    # do NOT emit it as an independent event.
+                    # If it does NOT belong to any authorized incident (unmatched visible event or incident omitted due to hidden other member),
+                    # emit it as an independent event with omit_correlation=True.
+                    if not belongs_to_authorized_incident:
+                        if _event_passes_filters(ev):
+                            output_items.append(
+                                {
+                                    "type": "event",
+                                    "event": to_public_dto(ev, omit_correlation=group_by_incident),
+                                }
+                            )
+                            item_accepted = True
+
+            if item_accepted and len(output_items) >= limit:
+                if item is batch[-1] and batch_next_cur is None:
+                    next_cursor = None
+                else:
+                    next_cursor = f"{item['sort_time']}|{item['type']}|{item['item_id']}"
+                stopped_early = True
+                break
+
+        if stopped_early:
+            break
+
+        if batch_next_cur is not None:
+            current_cursor = batch_next_cur
+            next_cursor = batch_next_cur
+        else:
+            next_cursor = None
+            break
+
+    consumers = api.get_registered_consumers() if api else []
+
+    connection.send_result(
+        msg["id"],
+        {
+            "items": output_items[:limit],
+            "next_cursor": next_cursor,
+            "capabilities": {
+                "consumers": consumers,
+            },
+        },
+    )

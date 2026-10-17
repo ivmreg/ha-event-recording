@@ -273,24 +273,31 @@ def stage_and_promote_media(
     hasher = hashlib.sha256()
     size_bytes = 0
 
-    with open(src_path, "rb") as f_in, open(temp_target, "wb") as f_out:
-        while chunk := f_in.read(65536):
-            hasher.update(chunk)
-            f_out.write(chunk)
-            size_bytes += len(chunk)
+    try:
+        with open(src_path, "rb") as f_in, open(temp_target, "wb") as f_out:
+            while chunk := f_in.read(65536):
+                hasher.update(chunk)
+                f_out.write(chunk)
+                size_bytes += len(chunk)
 
-    target_dir = (owned_root / event_id).resolve()
-    if not target_dir.is_relative_to(owned_root):
-        raise PathTraversalSecurityError(f"Target directory escapes owned root: {target_dir}")
+        target_dir = (owned_root / event_id).resolve()
+        if not target_dir.is_relative_to(owned_root):
+            raise PathTraversalSecurityError(f"Target directory escapes owned root: {target_dir}")
 
-    target_dir.mkdir(parents=True, exist_ok=True)
-    final_file_name = f"{media_id}{clean_ext}"
-    final_path = (target_dir / final_file_name).resolve()
-    if not final_path.is_relative_to(owned_root):
-        raise PathTraversalSecurityError(f"Target file escapes owned root: {final_path}")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        final_file_name = f"{media_id}{clean_ext}"
+        final_path = (target_dir / final_file_name).resolve()
+        if not final_path.is_relative_to(owned_root):
+            raise PathTraversalSecurityError(f"Target file escapes owned root: {final_path}")
 
-    # Atomic move into destination
-    os.replace(temp_target, final_path)
+        # Atomic move into destination
+        os.replace(temp_target, final_path)
+    finally:
+        if temp_target.exists():
+            try:
+                temp_target.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # Relative path inside owned media root (e.g. "event_123/media_abc.mp4")
     rel_path = f"{event_id}/{final_file_name}"

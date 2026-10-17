@@ -17,18 +17,103 @@ from homeassistant.helpers import config_validation as cv
 
 from .camera_profiles import get_camera_profiles
 from .const import (
+    CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+    CONF_ENABLE_AUTO_ASSOCIATION,
+    CONF_MAX_INCIDENT_SPAN_SECONDS,
     DATA_COORDINATOR,
     DATA_STORE,
+    DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+    DEFAULT_ENABLE_AUTO_ASSOCIATION,
+    DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
     DOMAIN,
     SERVICE_ATTACH_MEDIA,
     SERVICE_FINALIZE,
     SERVICE_LOG_EVENT,
     SERVICE_RECORD,
+    SERVICE_RECORD_EVENTS,
 )
-from .core.models import utc_now
+from .core.models import utc_now, validate_correlation_id
 from .core.store import JournalStore
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _build_auto_association_config(
+    coordinator: Any | None,
+    profile_defaults: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build auto_association_config combining global integration options and camera profile."""
+    if not coordinator or not getattr(coordinator, "entry", None):
+        return None
+    entry = coordinator.entry
+    options = getattr(entry, "options", {}) or {}
+    data = getattr(entry, "data", {}) or {}
+
+    enabled = bool(
+        options.get(
+            CONF_ENABLE_AUTO_ASSOCIATION,
+            data.get(CONF_ENABLE_AUTO_ASSOCIATION, DEFAULT_ENABLE_AUTO_ASSOCIATION),
+        )
+    )
+    if not enabled:
+        return {"enabled": False}
+
+    import math
+
+    raw_tol = options.get(
+        CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+        data.get(
+            CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+            DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+        ),
+    )
+    raw_span = options.get(
+        CONF_MAX_INCIDENT_SPAN_SECONDS,
+        data.get(
+            CONF_MAX_INCIDENT_SPAN_SECONDS,
+            DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
+        ),
+    )
+    tolerance = (
+        float(raw_tol)
+        if isinstance(raw_tol, (int, float)) and math.isfinite(raw_tol)
+        else DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS
+    )
+    max_span = (
+        float(raw_span)
+        if isinstance(raw_span, (int, float)) and math.isfinite(raw_span)
+        else DEFAULT_MAX_INCIDENT_SPAN_SECONDS
+    )
+
+    config: dict[str, Any] = {
+        "enabled": True,
+        "global_tolerance_seconds": max(1.0, min(60.0, tolerance)),
+        "max_incident_span_seconds": max(10.0, min(3600.0, max_span)),
+    }
+
+    if profile_defaults:
+        if profile_defaults.get("correlation_group"):
+            config["correlation_group"] = str(profile_defaults["correlation_group"])
+        if profile_defaults.get("zone"):
+            config["zone"] = str(profile_defaults["zone"])
+        if profile_defaults.get("adjacent_zones"):
+            config["adjacent_zones"] = list(profile_defaults["adjacent_zones"])
+        if "source_clock_offset_seconds" in profile_defaults:
+            try:
+                config["source_clock_offset_seconds"] = float(
+                    profile_defaults["source_clock_offset_seconds"]
+                )
+            except (TypeError, ValueError):
+                pass
+        if "source_time_uncertainty_seconds" in profile_defaults:
+            try:
+                config["source_time_uncertainty_seconds"] = float(
+                    profile_defaults["source_time_uncertainty_seconds"]
+                )
+            except (TypeError, ValueError):
+                pass
+
+    return config
 
 SCHEMA_LOG_EVENT = vol.Schema(
     {
@@ -36,6 +121,7 @@ SCHEMA_LOG_EVENT = vol.Schema(
         vol.Required("kind"): cv.string,
         vol.Optional("occurred_at"): cv.string,
         vol.Optional("idempotency_key"): cv.string,
+        vol.Optional("correlation_id"): cv.string,
         vol.Optional("label"): vol.Any(cv.string, None),
         vol.Optional("payload"): vol.Any(dict, None),
         vol.Optional("access_entities"): vol.Any(cv.ensure_list, None),
@@ -52,14 +138,29 @@ SCHEMA_RECORD = vol.Schema(
         vol.Optional("window_seconds"): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=300.0)),
         vol.Optional("occurred_at"): cv.string,
         vol.Optional("idempotency_key"): cv.string,
+        vol.Optional("correlation_id"): cv.string,
         vol.Optional("lookback_seconds"): vol.All(
             vol.Coerce(float), vol.Range(min=0.0, max=60.0)
         ),
-        vol.Optional("hold", default=False): cv.boolean,
+        vol.Optional("hold"): cv.boolean,
+        vol.Optional("tail_window_seconds"): vol.All(
+            vol.Coerce(float), vol.Range(min=0.0, max=300.0)
+        ),
         vol.Optional("recorder_config"): vol.Any(dict, None),
         vol.Optional("label"): vol.Any(cv.string, None),
         vol.Optional("payload"): vol.Any(dict, None),
         vol.Optional("access_entities"): vol.Any(cv.ensure_list, None),
+    }
+)
+
+SCHEMA_RECORD_EVENTS = vol.Schema(
+    {
+        vol.Required("events"): vol.All(cv.ensure_list, vol.Length(min=1, max=16)),
+        vol.Optional("correlation_id"): cv.string,
+        vol.Optional("occurred_at"): cv.string,
+        vol.Optional("kind"): cv.string,
+        vol.Optional("label"): vol.Any(cv.string, None),
+        vol.Optional("payload"): vol.Any(dict, None),
     }
 )
 
@@ -123,7 +224,8 @@ def async_register_services(hass: HomeAssistant) -> None:
         source_id = data["source_id"]
         kind = data["kind"]
         occurred_at = data.get("occurred_at") or utc_now()
-        idempotency_key = data.get("idempotency_key") or call.context.id or uuid.uuid4().hex
+        idempotency_key = data.get("idempotency_key") or uuid.uuid4().hex
+        correlation_id = data.get("correlation_id")
         label = data.get("label")
         payload = data.get("payload") or {}
         access_entities = tuple(data.get("access_entities") or ())
@@ -131,6 +233,14 @@ def async_register_services(hass: HomeAssistant) -> None:
         # Security check for human callers on explicit access entities
         if access_entities and call.context.user_id is not None:
             await _check_human_permission(hass, call, access_entities, "control")
+
+        coordinator = domain_data.get(DATA_COORDINATOR)
+        profile_defaults = None
+        if coordinator:
+            profiles = get_camera_profiles(coordinator.entry)
+            profile_defaults = profiles.get(source_id)
+
+        auto_association_config = _build_auto_association_config(coordinator, profile_defaults)
 
         event, inserted = await store.log_event(
             source_id=source_id,
@@ -141,20 +251,25 @@ def async_register_services(hass: HomeAssistant) -> None:
             payload=payload,
             access_entities=access_entities,
             owner_user_id=call.context.user_id,
+            correlation_id=correlation_id,
+            auto_association_config=auto_association_config,
         )
 
         return {"event_id": event.event_id, "inserted": inserted}
 
-    async def handle_record(call: ServiceCall) -> dict[str, Any]:
+    async def _admit_record_payload(
+        data: dict[str, Any], context: Any
+    ) -> dict[str, Any]:
         domain_data = hass.data.get(DOMAIN, {})
         store: JournalStore | None = domain_data.get(DATA_STORE)
         coordinator = domain_data.get(DATA_COORDINATOR)
         if not store:
             raise HomeAssistantError("Event Recording integration is not initialized")
 
-        data = call.data
         source_id = data.get("source_id")
-        kind = data["kind"]
+        kind = data.get("kind")
+        if not kind:
+            raise HomeAssistantError("kind is required for recording")
         resource_key = data.get("resource_key")
         shortcut_camera = data.get("camera_entity")
         if shortcut_camera:
@@ -167,12 +282,16 @@ def async_register_services(hass: HomeAssistant) -> None:
             resource_key = shortcut_camera
         if not resource_key:
             raise HomeAssistantError("resource_key is required unless camera_entity is provided")
-        operation = data["operation"]
+        operation = data.get("operation", "start_or_extend")
         window_seconds = data.get("window_seconds")
         occurred_at = data.get("occurred_at") or utc_now()
-        idempotency_key = data.get("idempotency_key") or call.context.id or uuid.uuid4().hex
+        idempotency_key = data.get("idempotency_key") or uuid.uuid4().hex
+        correlation_id = data.get("correlation_id")
         lookback_seconds = data.get("lookback_seconds")
-        hold = bool(data.get("hold", False))
+        action_hold: bool | None = data.get("hold") if "hold" in data else None
+        action_tail: float | None = (
+            float(data["tail_window_seconds"]) if "tail_window_seconds" in data else None
+        )
         explicit_recorder_config = dict(data.get("recorder_config") or {})
         # This key is reserved for the integration's durable per-session snapshot.
         explicit_recorder_config.pop("_event_recording_profile", None)
@@ -216,8 +335,35 @@ def async_register_services(hass: HomeAssistant) -> None:
             if resource_key not in raw_access:
                 raw_access.append(resource_key)
 
-            if call.context.user_id is not None:
-                await _check_human_permission(hass, call, [resource_key], "control")
+            if context.user_id is not None:
+                user = await hass.auth.async_get_user(context.user_id)
+                if not user or not getattr(user, "is_active", True):
+                    raise Unauthorized(context=context)
+                if not user.is_admin:
+                    if not user.permissions.check_entity(resource_key, "control"):
+                        raise Unauthorized(context=context)
+
+        if action_hold is not None:
+            hold = bool(action_hold)
+        elif (
+            profile_defaults is not None
+            and "hold" in profile_defaults
+            and profile_defaults["hold"] is not None
+        ):
+            hold = bool(profile_defaults["hold"])
+        else:
+            hold = False
+
+        if action_tail is not None:
+            tail_window_seconds = float(action_tail)
+        elif (
+            profile_defaults is not None
+            and "tail_window_seconds" in profile_defaults
+            and profile_defaults["tail_window_seconds"] is not None
+        ):
+            tail_window_seconds = float(profile_defaults["tail_window_seconds"])
+        else:
+            tail_window_seconds = 0.0
 
         if source_id is None:
             raise HomeAssistantError(
@@ -231,8 +377,14 @@ def async_register_services(hass: HomeAssistant) -> None:
         lookback_seconds = float(lookback_seconds if lookback_seconds is not None else 0.0)
 
         access_entities = tuple(raw_access)
-        if access_entities and call.context.user_id is not None:
-            await _check_human_permission(hass, call, access_entities, "control")
+        if access_entities and context.user_id is not None:
+            user = await hass.auth.async_get_user(context.user_id)
+            if not user or not getattr(user, "is_active", True):
+                raise Unauthorized(context=context)
+            if not user.is_admin:
+                for ent in access_entities:
+                    if not user.permissions.check_entity(ent, "control"):
+                        raise Unauthorized(context=context)
 
         admit = coordinator.admit_record_intent if coordinator else store.admit_record_intent
         extra_admission: dict[str, Any] = {}
@@ -242,6 +394,7 @@ def async_register_services(hass: HomeAssistant) -> None:
                 "_explicit_fields": frozenset(data),
                 "_explicit_recorder_config": explicit_recorder_config,
             }
+        auto_association_config = _build_auto_association_config(coordinator, profile_defaults)
         event, inserted, intent_id = await admit(
             source_id=source_id,
             kind=kind,
@@ -256,7 +409,10 @@ def async_register_services(hass: HomeAssistant) -> None:
             label=label,
             payload=payload,
             access_entities=access_entities,
-            owner_user_id=call.context.user_id,
+            owner_user_id=context.user_id,
+            tail_window_seconds=tail_window_seconds,
+            correlation_id=correlation_id,
+            auto_association_config=auto_association_config,
             **extra_admission,
         )
 
@@ -267,6 +423,61 @@ def async_register_services(hass: HomeAssistant) -> None:
             "event_id": event.event_id,
             "inserted": inserted,
             "intent_id": intent_id,
+        }
+
+    async def handle_record(call: ServiceCall) -> dict[str, Any]:
+        return await _admit_record_payload(call.data, call.context)
+
+    async def handle_record_events(call: ServiceCall) -> dict[str, Any]:
+        data = call.data
+        shared_correlation_id = data.get("correlation_id") or f"corr_{uuid.uuid4().hex[:12]}"
+        validate_correlation_id(shared_correlation_id)
+
+        top_occurred_at = data.get("occurred_at")
+        top_kind = data.get("kind")
+        top_label = data.get("label")
+        top_payload = data.get("payload")
+
+        results: list[dict[str, Any]] = []
+        for raw_item in data["events"]:
+            item_data = dict(raw_item)
+            if "kind" not in item_data and top_kind:
+                item_data["kind"] = top_kind
+            if "occurred_at" not in item_data and top_occurred_at:
+                item_data["occurred_at"] = top_occurred_at
+            if "label" not in item_data and top_label:
+                item_data["label"] = top_label
+            if "payload" not in item_data and top_payload:
+                item_data["payload"] = dict(top_payload)
+
+            item_data["correlation_id"] = shared_correlation_id
+            if "idempotency_key" not in item_data:
+                item_data["idempotency_key"] = uuid.uuid4().hex
+
+            try:
+                res = await _admit_record_payload(item_data, call.context)
+                results.append(
+                    {
+                        "event_id": res["event_id"],
+                        "inserted": res["inserted"],
+                        "intent_id": res["intent_id"],
+                        "resource_key": item_data.get("resource_key") or item_data.get("camera_entity"),
+                        "status": "ok",
+                    }
+                )
+            except Exception as err:
+                _LOGGER.warning("record_events item failed: %s", err)
+                results.append(
+                    {
+                        "resource_key": item_data.get("resource_key") or item_data.get("camera_entity"),
+                        "status": "error",
+                        "error": str(err),
+                    }
+                )
+
+        return {
+            "correlation_id": shared_correlation_id,
+            "results": results,
         }
 
     async def handle_attach_media(call: ServiceCall) -> dict[str, Any]:
@@ -341,6 +552,13 @@ def async_register_services(hass: HomeAssistant) -> None:
         SERVICE_RECORD,
         handle_record,
         schema=SCHEMA_RECORD,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RECORD_EVENTS,
+        handle_record_events,
+        schema=SCHEMA_RECORD_EVENTS,
         supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(

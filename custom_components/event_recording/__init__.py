@@ -88,7 +88,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         _LOGGER.error("Failed to initialize Event Recording integration: %s", err)
         # Rollback partial setup
         if "services" in registered_items:
-            for s_name in ("log_event", "record", "attach_media", "finalize"):
+            for s_name in ("log_event", "record", "record_events", "attach_media", "finalize"):
                 hass.services.async_remove(DOMAIN, s_name)
         return False
 
@@ -229,3 +229,4 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
     # Entry options are read dynamically by retention properties and profile lookup.
     coordinator.entry = entry
+    await coordinator.set_max_parallel_resources(coordinator.max_parallel_resources)

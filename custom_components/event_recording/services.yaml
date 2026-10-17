@@ -28,6 +28,12 @@ log_event:
       required: false
       selector:
         text: {}
+    correlation_id:
+      name: Correlation ID
+      description: Optional correlation identifier grouping related events across cameras into an incident.
+      required: false
+      selector:
+        text: {}
     label:
       name: Label
       description: Optional human-readable event title or description.
@@ -110,6 +116,12 @@ record:
       required: false
       selector:
         text: {}
+    correlation_id:
+      name: Correlation ID
+      description: Optional correlation identifier grouping related recordings across cameras into an incident.
+      required: false
+      selector:
+        text: {}
     lookback_seconds:
       name: Lookback Seconds
       description: Seconds of pre-event buffer to capture (0-60).
@@ -122,7 +134,6 @@ record:
       name: Hold
       description: Keep recording continuously until explicit end_after or bounded 300s timeout.
       required: false
-      default: false
       selector:
         boolean: {}
     recorder_config:
@@ -150,6 +161,47 @@ record:
       selector:
         entity:
           multiple: true
+
+record_events:
+  name: Record Events Fanout
+  description: Queue a bounded fanout of recording intents across multiple cameras sharing a correlation ID.
+  fields:
+    events:
+      name: Events
+      description: Non-empty bounded list (1-16) of standard recording specifications.
+      required: true
+      selector:
+        object: {}
+    correlation_id:
+      name: Shared Correlation ID
+      description: Shared correlation identifier across all cameras. Auto-generated if omitted.
+      required: false
+      selector:
+        text: {}
+    occurred_at:
+      name: Default Occurred At
+      description: Shared default timestamp applied to items omitting occurred_at.
+      required: false
+      selector:
+        datetime: {}
+    kind:
+      name: Default Kind
+      description: Shared default kind string applied to items omitting kind.
+      required: false
+      selector:
+        text: {}
+    label:
+      name: Default Label
+      description: Shared default label applied to items omitting label.
+      required: false
+      selector:
+        text: {}
+    payload:
+      name: Default Payload
+      description: Shared default payload dictionary applied to items omitting payload.
+      required: false
+      selector:
+        object: {}
 
 attach_media:
   name: Attach Media
