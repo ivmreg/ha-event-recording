@@ -36,9 +36,7 @@ def _get_camera(hass: HomeAssistant, entity_id: str) -> Any:
     return get_camera_from_entity_id(hass, entity_id)
 
 
-async def _await_executor_job[T](
-    hass: HomeAssistant, function: Callable[..., T], *args: Any
-) -> T:
+async def _await_executor_job[T](hass: HomeAssistant, function: Callable[..., T], *args: Any) -> T:
     """Wait for an executor Future to finish, even across repeated cancellation."""
     future = hass.async_add_executor_job(function, *args)
     cancellation: asyncio.CancelledError | None = None
@@ -127,13 +125,6 @@ async def async_record_stream(
     hls = outputs.get(_PROVIDER)
     if hls is None:
         hls = stream.add_provider(_PROVIDER)
-    await stream.start()
-
-    settings = getattr(stream, "_stream_settings", None)
-    min_segment_duration = float(getattr(settings, "min_segment_duration", 0.0))
-    dynamic_settings = getattr(stream, "dynamic_stream_settings", None)
-    orientation = int(getattr(dynamic_settings, "orientation", 1))
-    writer = await _create_writer(hass, target_path, min_segment_duration, orientation)
 
     target_duration = float(getattr(hls, "target_duration", 6.0) or 6.0)
     heartbeat_interval = min(_HEARTBEAT_SECONDS, max(0.1, target_duration / 4))
@@ -145,16 +136,19 @@ async def async_record_stream(
     deadline = loop.time() + duration_seconds + lookback_seconds + deadline_padding
     captured_live_duration = 0.0
     last_sequence: int | None = None
-
-    def check_provider() -> None:
-        if stream.outputs().get(_PROVIDER) is not hls or getattr(hls, "idle", False):
-            raise StreamCaptureError("Shared HLS stream provider became idle or was removed")
+    heartbeat_error: BaseException | None = None
 
     def wake_provider() -> None:
         idle_timer = getattr(hls, "idle_timer", None)
         awake = getattr(idle_timer, "awake", None)
-        if awake is not None:
+        if callable(awake):
             awake()
+
+    def check_provider() -> None:
+        if heartbeat_error is not None:
+            raise heartbeat_error
+        if stream.outputs().get(_PROVIDER) is not hls or getattr(hls, "idle", False):
+            raise StreamCaptureError("Shared HLS stream provider became idle or was removed")
 
     def mark_sequence(segment: Any) -> None:
         nonlocal last_sequence
@@ -163,15 +157,40 @@ async def async_record_stream(
             raise StreamCaptureError("Shared HLS stream segment sequence gap detected")
         last_sequence = sequence
 
-    heartbeat: asyncio.Task[None] | None = None
-
     async def maintain_provider() -> None:
-        while True:
-            await asyncio.sleep(heartbeat_interval)
-            check_provider()
-            wake_provider()
+        nonlocal heartbeat_error
+        try:
+            while True:
+                await asyncio.sleep(heartbeat_interval)
+                check_provider()
+                wake_provider()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            heartbeat_error = err
+            raise
+
+    # Wake provider immediately on acquisition before any startup/writer awaits
+    wake_provider()
+
+    writer: StreamMuxWriter | None = None
+    heartbeat: asyncio.Task[None] | None = None
+    cancellation: asyncio.CancelledError | None = None
 
     try:
+        # Keep provider alive throughout startup, writer construction, and capture
+        heartbeat = asyncio.create_task(maintain_provider())
+
+        await stream.start()
+        check_provider()
+
+        settings = getattr(stream, "_stream_settings", None)
+        min_segment_duration = float(getattr(settings, "min_segment_duration", 0.0))
+        dynamic_settings = getattr(stream, "dynamic_stream_settings", None)
+        orientation = int(getattr(dynamic_settings, "orientation", 1))
+        writer = await _create_writer(hass, target_path, min_segment_duration, orientation)
+        check_provider()
+
         # Freeze the boundary before awaiting segment copies. Only completed buffered
         # segments are eligible for lookback; an incomplete current segment is live.
         boundary_segments = list(hls.get_segments())
@@ -187,24 +206,34 @@ async def async_record_stream(
             incomplete = [s for s in boundary_segments if not s.complete]
             last_sequence = int(incomplete[0].sequence) - 1 if incomplete else None
 
-        heartbeat = asyncio.create_task(maintain_provider())
-
         # Drain eligible historical segments first, in order.
         for segment in selected:
+            check_provider()
+            wake_provider()
             mark_sequence(segment)
-            await _await_executor_job(hass, writer.write_segment, await _snapshot_segment(hass, segment))
+            await _await_executor_job(
+                hass, writer.write_segment, await _snapshot_segment(hass, segment)
+            )
 
         while captured_live_duration < duration_seconds:
             check_provider()
             wake_provider()
             if loop.time() >= deadline:
-                raise StreamCaptureError("Timed out before requested live media duration was captured")
+                raise StreamCaptureError(
+                    "Timed out before requested live media duration was captured"
+                )
 
             # Process any segment completed since the last receive before waiting. HA
             # signals a newly-created segment, by which point its predecessor is complete.
             segments = list(hls.get_segments())
-            ready = [s for s in segments if s.complete and (last_sequence is None or int(s.sequence) > last_sequence)]
+            ready = [
+                s
+                for s in segments
+                if s.complete and (last_sequence is None or int(s.sequence) > last_sequence)
+            ]
             for segment in ready:
+                check_provider()
+                wake_provider()
                 mark_sequence(segment)
                 snapshot = await _snapshot_segment(hass, segment)
                 await _await_executor_job(hass, writer.write_segment, snapshot)
@@ -219,13 +248,37 @@ async def async_record_stream(
             except TimeoutError:
                 continue
 
+        check_provider()
         # A whole-segment capture can exceed the requested duration slightly.
         result = await _await_executor_job(hass, writer.finish)
         return result
+    except asyncio.CancelledError as err:
+        cancellation = err
+        raise
     finally:
         try:
             if heartbeat is not None:
                 heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
+                while not heartbeat.done():
+                    try:
+                        await asyncio.shield(heartbeat)
+                    except asyncio.CancelledError as err:
+                        cur = asyncio.current_task()
+                        cancelling = getattr(cur, "cancelling", None)
+                        if cancelling is not None and cancelling() > 0:
+                            cancellation = err
+                        elif cancelling is None:
+                            cancellation = err
+                    except Exception:
+                        break
+                if not heartbeat.cancelled():
+                    _ = heartbeat.exception()
         finally:
-            await _await_executor_job(hass, writer.close)
+            if writer is not None:
+                try:
+                    await _await_executor_job(hass, writer.close)
+                except asyncio.CancelledError as err:
+                    if cancellation is None:
+                        cancellation = err
+            if cancellation is not None:
+                raise cancellation
