@@ -18,7 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 MAX_LOOKBACK_SEGMENTS = 50
 _PROVIDER = "hls"
 _HEARTBEAT_SECONDS = 1.0
-_MIN_DEADLINE_PADDING_SECONDS = 5.0
+_CLEANUP_MARGIN_SECONDS = 0.5
 
 
 class CameraStreamUnavailableError(Exception):
@@ -114,8 +114,18 @@ async def async_record_stream(
     duration_seconds: float,
     lookback_seconds: float = 0.0,
     watchdog_padding_seconds: float = DEFAULT_WATCHDOG_PADDING_SECONDS,
+    watchdog_deadline: float | None = None,
 ) -> dict[str, Any]:
     """Capture shared HLS segments without consuming or removing the provider."""
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    total_budget = duration_seconds + lookback_seconds + watchdog_padding_seconds
+    hard_deadline = (
+        watchdog_deadline if watchdog_deadline is not None else (started_at + total_budget)
+    )
+    cleanup_margin = min(_CLEANUP_MARGIN_SECONDS, max(0.0, watchdog_padding_seconds) * 0.1)
+    capture_deadline = hard_deadline - cleanup_margin
+
     camera = _get_camera(hass, camera_entity)
     stream = await camera.async_create_stream()
     if not stream:
@@ -128,15 +138,30 @@ async def async_record_stream(
 
     target_duration = float(getattr(hls, "target_duration", 6.0) or 6.0)
     heartbeat_interval = min(_HEARTBEAT_SECONDS, max(0.1, target_duration / 4))
-    deadline_padding = min(
-        max(0.1, watchdog_padding_seconds - 0.1),
-        max(_MIN_DEADLINE_PADDING_SECONDS, target_duration * 2),
-    )
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + duration_seconds + lookback_seconds + deadline_padding
     captured_live_duration = 0.0
+    completed_live_segments = 0
     last_sequence: int | None = None
     heartbeat_error: BaseException | None = None
+    setup_done_at: float | None = None
+
+    def raise_capture_timeout() -> None:
+        now = loop.time()
+        elapsed_setup = (
+            (setup_done_at - started_at) if setup_done_at is not None else (now - started_at)
+        )
+        _LOGGER.warning(
+            "Shared stream capture timed out: elapsed_setup=%.2fs, elapsed_total=%.2fs, "
+            "captured_live=%.2fs, requested_live=%.2fs, completed_segments=%d, "
+            "target_duration=%.2fs, watchdog_budget=%.2fs",
+            elapsed_setup,
+            now - started_at,
+            captured_live_duration,
+            duration_seconds,
+            completed_live_segments,
+            target_duration,
+            hard_deadline - started_at,
+        )
+        raise StreamCaptureError("Timed out before requested live media duration was captured")
 
     def wake_provider() -> None:
         idle_timer = getattr(hls, "idle_timer", None)
@@ -215,13 +240,13 @@ async def async_record_stream(
                 hass, writer.write_segment, await _snapshot_segment(hass, segment)
             )
 
+        setup_done_at = loop.time()
+
         while captured_live_duration < duration_seconds:
             check_provider()
             wake_provider()
-            if loop.time() >= deadline:
-                raise StreamCaptureError(
-                    "Timed out before requested live media duration was captured"
-                )
+            if loop.time() >= capture_deadline:
+                raise_capture_timeout()
 
             # Process any segment completed since the last receive before waiting. HA
             # signals a newly-created segment, by which point its predecessor is complete.
@@ -238,11 +263,14 @@ async def async_record_stream(
                 snapshot = await _snapshot_segment(hass, segment)
                 await _await_executor_job(hass, writer.write_segment, snapshot)
                 captured_live_duration += snapshot.duration
+                completed_live_segments += 1
 
             if captured_live_duration >= duration_seconds:
                 break
             check_provider()
-            remaining = deadline - loop.time()
+            remaining = capture_deadline - loop.time()
+            if remaining <= 0:
+                raise_capture_timeout()
             try:
                 await asyncio.wait_for(hls.recv(), timeout=min(heartbeat_interval, remaining))
             except TimeoutError:

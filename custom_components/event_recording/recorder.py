@@ -476,6 +476,9 @@ class CameraRecorderAdapter:
         ):
             from .stream_capture import async_record_stream
 
+            loop = asyncio.get_running_loop()
+            watchdog_deadline = loop.time() + duration_seconds + lookback_seconds + self.padding
+
             record_task = asyncio.create_task(
                 async_record_stream(
                     hass=self.hass,
@@ -484,13 +487,14 @@ class CameraRecorderAdapter:
                     duration_seconds=duration_seconds,
                     lookback_seconds=lookback_seconds,
                     watchdog_padding_seconds=self.padding,
+                    watchdog_deadline=watchdog_deadline,
                 )
             )
 
             self.registry.register_active(camera_entity, record_task, ownership_group)
 
             try:
-                watchdog_timeout = duration_seconds + lookback_seconds + self.padding
+                watchdog_timeout = max(0.0, watchdog_deadline - loop.time())
                 await asyncio.wait_for(asyncio.shield(record_task), timeout=watchdog_timeout)
             except (asyncio.CancelledError, TimeoutError) as err:
                 if not record_task.done():
