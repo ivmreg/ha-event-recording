@@ -212,6 +212,27 @@ class RecordingAPI:
             ttl_seconds=ttl_seconds,
         )
 
+    async def renew_incident_annotation_reservation(
+        self,
+        incident_id: str,
+        namespace: str,
+        expected_generation: int,
+        expected_input_token: str,
+        profile_digest: str,
+        worker_id: str | None = None,
+        ttl_seconds: float = 60.0,
+    ) -> bool:
+        """Renew the same current incident reservation without changing its generation."""
+        return await self._store.renew_incident_annotation_reservation(
+            incident_id=incident_id,
+            namespace=namespace,
+            expected_generation=expected_generation,
+            expected_input_token=expected_input_token,
+            profile_digest=profile_digest,
+            worker_id=worker_id,
+            ttl_seconds=ttl_seconds,
+        )
+
     async def set_incident_annotation_cas(
         self,
         incident_id: str,
@@ -231,9 +252,7 @@ class RecordingAPI:
             profile_digest=profile_digest,
         )
 
-    def subscribe_incidents(
-        self, callback: Callable[[str, int], None]
-    ) -> Callable[[], None]:
+    def subscribe_incidents(self, callback: Callable[[str, int], None]) -> Callable[[], None]:
         """Subscribe to post-commit incident revision updates."""
         return self._store.subscribe_incidents(callback)
 

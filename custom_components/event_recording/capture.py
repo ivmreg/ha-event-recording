@@ -106,9 +106,7 @@ class CaptureExecutor:
         """Conclude capture state adhering strictly to invariant: zero clips CANNOT be ready."""
         if valid_clips_count == 0:
             terminal_error = error or "ZERO_CLIPS_RECORDED"
-            await self.store.update_capture_state(
-                event_id, "failed", error_code=terminal_error
-            )
+            await self.store.update_capture_state(event_id, "failed", error_code=terminal_error)
         elif error:
             await self.store.update_capture_state(event_id, "partial", error_code=error)
         else:
@@ -136,9 +134,8 @@ class CaptureExecutor:
             or session_config.get("recording_mode")
             or MODE_EXTEND
         )
-        ownership_group = (
-            profile_snapshot.get("ownership_group")
-            or session_config.get("ownership_group")
+        ownership_group = profile_snapshot.get("ownership_group") or session_config.get(
+            "ownership_group"
         )
 
         is_expired, deadline_seconds, scene_deadline = (
@@ -298,11 +295,7 @@ class CaptureExecutor:
                 )
                 chunk_dur = min(chunk_seconds, max(1.0, remaining), max_remaining)
 
-                lookback = (
-                    self.coordinator._lookbacks.get(event_id, 0.0)
-                    if is_first_chunk
-                    else 0.0
-                )
+                lookback = self.coordinator._lookbacks.get(event_id, 0.0) if is_first_chunk else 0.0
                 is_first_chunk = False
 
                 chunk_reservation = int(chunk_dur * ESTIMATED_BYTES_PER_SECOND)
@@ -316,20 +309,15 @@ class CaptureExecutor:
                         res_id, staging_path, chunk_reservation, sidecar_paths=(sidecar_tmp,)
                     )
                 except StorageCapacityError as cap_err:
-                    _LOGGER.warning(
-                        "Storage admission rejected for %s: %s", resource_key, cap_err
-                    )
+                    _LOGGER.warning("Storage admission rejected for %s: %s", resource_key, cap_err)
                     last_error = ERROR_STORAGE_CAPACITY_EXCEEDED
-                    await self.store.update_capture_state(
-                        event_id, "failed", error_code=last_error
-                    )
+                    await self.store.update_capture_state(event_id, "failed", error_code=last_error)
                     break
 
                 try:
                     chunk_recorded = False
-                    chunk_req_start = (
-                        now - timedelta(seconds=lookback) if lookback > 0 else now
-                    )
+                    partial_error: str | None = None
+                    chunk_req_start = now - timedelta(seconds=lookback) if lookback > 0 else now
                     chunk_req_end = now + timedelta(seconds=chunk_dur)
 
                     lock_timeout = (
@@ -339,7 +327,7 @@ class CaptureExecutor:
                     )
 
                     try:
-                        await self.adapter.record_chunk(
+                        chunk_result = await self.adapter.record_chunk(
                             camera_entity=resource_key,
                             target_path=staging_path,
                             duration_seconds=chunk_dur,
@@ -348,6 +336,22 @@ class CaptureExecutor:
                             lock_timeout_seconds=lock_timeout,
                         )
                         chunk_recorded = True
+                        if isinstance(chunk_result, dict):
+                            raw_partial = chunk_result.get("partial_error")
+                            if raw_partial:
+                                partial_error = (
+                                    raw_partial
+                                    if isinstance(raw_partial, str)
+                                    and raw_partial
+                                    in (
+                                        "STREAM_CAPTURE_FAILED",
+                                        "STREAM_CAPTURE_TIMEOUT",
+                                        "STREAM_SEQUENCE_GAP",
+                                        "STREAM_PROVIDER_LOST",
+                                    )
+                                    else "STREAM_CAPTURE_FAILED"
+                                )
+                                last_error = partial_error
                     except ResourceQuarantinedError:
                         last_error = ERROR_RESOURCE_QUARANTINED
                         self.store.storage_ledger.mark_quarantined(res_id)
@@ -396,6 +400,8 @@ class CaptureExecutor:
                                 adopt_staging=True,
                             )
                             valid_clips_count += 1
+                            if partial_error:
+                                break
                         except Exception as prom_err:
                             last_error = (
                                 sanitize_capture_error(prom_err) or "MEDIA_PROMOTION_FAILED"
@@ -422,6 +428,7 @@ class CaptureExecutor:
                             )
                     self.store.storage_ledger.release_reservation(res_id)
                     if not self.registry.is_quarantined(resource_key, ownership_group):
+
                         def _cleanup_staging() -> None:
                             staging_path.unlink(missing_ok=True)
                             sidecar_tmp.unlink(missing_ok=True)
@@ -438,9 +445,7 @@ class CaptureExecutor:
         except asyncio.CancelledError:
             if event_id:
                 final_state = "partial" if valid_clips_count > 0 else "interrupted"
-                await self.store.update_capture_state(
-                    event_id, final_state, error_code="CANCELLED"
-                )
+                await self.store.update_capture_state(event_id, final_state, error_code="CANCELLED")
             raise
         finally:
             await self.slot_manager.release()
@@ -520,6 +525,7 @@ class CaptureExecutor:
                     )
             self.store.storage_ledger.release_reservation(res_id)
             if not self.registry.is_quarantined(resource_key, ownership_group):
+
                 def _cleanup_snap_staging() -> None:
                     staging_path.unlink(missing_ok=True)
 
@@ -561,20 +567,17 @@ class CaptureExecutor:
             if wait_sec > 0:
                 await asyncio.sleep(min(wait_sec, float(max_window_seconds)))
 
-            cam_name = (
-                profile_snapshot.get("frigate_camera_name")
-                or session_config.get("frigate_camera_name")
+            cam_name = profile_snapshot.get("frigate_camera_name") or session_config.get(
+                "frigate_camera_name"
             )
             if not cam_name:
                 raise RecorderError("MISSING_FRIGATE_CAMERA_NAME")
 
-            frigate_url = (
-                profile_snapshot.get("frigate_base_url")
-                or session_config.get("frigate_base_url")
+            frigate_url = profile_snapshot.get("frigate_base_url") or session_config.get(
+                "frigate_base_url"
             )
-            frigate_token = (
-                profile_snapshot.get("frigate_auth_token")
-                or session_config.get("frigate_auth_token")
+            frigate_token = profile_snapshot.get("frigate_auth_token") or session_config.get(
+                "frigate_auth_token"
             )
 
             adapter_cls = _get_frigate_buffered_adapter()
@@ -632,6 +635,7 @@ class CaptureExecutor:
         finally:
             self.store.storage_ledger.release_reservation(res_id)
             if not self.registry.is_quarantined(resource_key, ownership_group):
+
                 def _cleanup_buf_staging() -> None:
                     staging_path.unlink(missing_ok=True)
 

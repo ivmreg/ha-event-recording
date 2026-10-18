@@ -25,8 +25,22 @@ class CameraStreamUnavailableError(Exception):
     """Raised when Home Assistant cannot create a camera stream."""
 
 
+STREAM_CAPTURE_FAILED = "STREAM_CAPTURE_FAILED"
+STREAM_CAPTURE_TIMEOUT = "STREAM_CAPTURE_TIMEOUT"
+STREAM_SEQUENCE_GAP = "STREAM_SEQUENCE_GAP"
+STREAM_PROVIDER_LOST = "STREAM_PROVIDER_LOST"
+
+
 class StreamCaptureError(Exception):
     """Raised when shared-stream capture cannot produce the requested recording."""
+
+    def __init__(
+        self,
+        message: str = "Stream capture failed",
+        code: str = STREAM_CAPTURE_FAILED,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _get_camera(hass: HomeAssistant, entity_id: str) -> Any:
@@ -140,6 +154,7 @@ async def async_record_stream(
     heartbeat_interval = min(_HEARTBEAT_SECONDS, max(0.1, target_duration / 4))
     captured_live_duration = 0.0
     completed_live_segments = 0
+    written_segments = 0
     last_sequence: int | None = None
     heartbeat_error: BaseException | None = None
     setup_done_at: float | None = None
@@ -161,7 +176,10 @@ async def async_record_stream(
             target_duration,
             hard_deadline - started_at,
         )
-        raise StreamCaptureError("Timed out before requested live media duration was captured")
+        raise StreamCaptureError(
+            "Timed out before requested live media duration was captured",
+            code=STREAM_CAPTURE_TIMEOUT,
+        )
 
     def wake_provider() -> None:
         idle_timer = getattr(hls, "idle_timer", None)
@@ -173,13 +191,19 @@ async def async_record_stream(
         if heartbeat_error is not None:
             raise heartbeat_error
         if stream.outputs().get(_PROVIDER) is not hls or getattr(hls, "idle", False):
-            raise StreamCaptureError("Shared HLS stream provider became idle or was removed")
+            raise StreamCaptureError(
+                "Shared HLS stream provider became idle or was removed",
+                code=STREAM_PROVIDER_LOST,
+            )
 
     def mark_sequence(segment: Any) -> None:
         nonlocal last_sequence
         sequence = int(segment.sequence)
         if last_sequence is not None and sequence != last_sequence + 1:
-            raise StreamCaptureError("Shared HLS stream segment sequence gap detected")
+            raise StreamCaptureError(
+                "Shared HLS stream segment sequence gap detected",
+                code=STREAM_SEQUENCE_GAP,
+            )
         last_sequence = sequence
 
     async def maintain_provider() -> None:
@@ -239,6 +263,7 @@ async def async_record_stream(
             await _await_executor_job(
                 hass, writer.write_segment, await _snapshot_segment(hass, segment)
             )
+            written_segments += 1
 
         setup_done_at = loop.time()
 
@@ -262,6 +287,7 @@ async def async_record_stream(
                 mark_sequence(segment)
                 snapshot = await _snapshot_segment(hass, segment)
                 await _await_executor_job(hass, writer.write_segment, snapshot)
+                written_segments += 1
                 captured_live_duration += snapshot.duration
                 completed_live_segments += 1
 
@@ -280,6 +306,16 @@ async def async_record_stream(
         # A whole-segment capture can exceed the requested duration slightly.
         result = await _await_executor_job(hass, writer.finish)
         return result
+    except StreamCaptureError as err:
+        if writer is not None and written_segments > 0:
+            try:
+                res = await _await_executor_job(hass, writer.finish)
+            except Exception:
+                raise err from None
+            result = dict(res) if isinstance(res, dict) else {}
+            result["partial_error"] = getattr(err, "code", STREAM_CAPTURE_FAILED)
+            return result
+        raise
     except asyncio.CancelledError as err:
         cancellation = err
         raise

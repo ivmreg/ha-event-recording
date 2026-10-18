@@ -175,6 +175,7 @@ class RecorderRegistry:
             self._quarantined_sidecar_files[res_id] = tuple(Path(p) for p in sidecar_paths)
 
         if task is not None:
+
             def _settle_task(t: asyncio.Task[Any]) -> None:
                 self.settle_quarantined_reservation(res_id)
 
@@ -449,8 +450,8 @@ class CameraRecorderAdapter:
         lookback_seconds: float = 0.0,
         ownership_group: str | None = None,
         lock_timeout_seconds: float = 15.0,
-    ) -> None:
-        """Capture one stream chunk with quarantine and alias coordination."""
+    ) -> dict[str, Any] | None:
+        """Capture one stream chunk and return settled backend metadata."""
         resolved_path = await self.hass.async_add_executor_job(Path(target_path).resolve)
         await self.hass.async_add_executor_job(
             lambda: resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -495,7 +496,7 @@ class CameraRecorderAdapter:
 
             try:
                 watchdog_timeout = max(0.0, watchdog_deadline - loop.time())
-                await asyncio.wait_for(asyncio.shield(record_task), timeout=watchdog_timeout)
+                return await asyncio.wait_for(asyncio.shield(record_task), timeout=watchdog_timeout)
             except (asyncio.CancelledError, TimeoutError) as err:
                 if not record_task.done():
                     self.registry.quarantine(camera_entity, record_task, ownership_group)
@@ -575,6 +576,7 @@ class SnapshotRecorderAdapter:
         async with self.registry.acquire_locks(
             camera_entity, ownership_group, timeout_seconds=lock_timeout_seconds
         ):
+
             async def _do_snapshot() -> dict[str, Any]:
                 from homeassistant.components.camera import async_get_image
 
@@ -777,9 +779,7 @@ class FrigateBufferedAdapter:
                         gaps.append({"start": start_ts, "end": end_ts})
 
                     gap_quality = (
-                        "complete"
-                        if is_complete
-                        else ("partial" if total_covered > 0 else "empty")
+                        "complete" if is_complete else ("partial" if total_covered > 0 else "empty")
                     )
 
                     return {
@@ -811,7 +811,9 @@ class FrigateBufferedAdapter:
     ) -> dict[str, Any]:
         """Export retained clip window from Frigate HTTP API with bounded stream cap."""
         if not self.base_url:
-            raise BufferUnavailableError("Frigate buffered provider not configured (missing base_url)")
+            raise BufferUnavailableError(
+                "Frigate buffered provider not configured (missing base_url)"
+            )
 
         clean_name = camera_name.strip()
         if not re.match(r"^[a-zA-Z0-9_-]+$", clean_name):

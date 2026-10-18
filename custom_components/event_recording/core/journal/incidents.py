@@ -83,7 +83,9 @@ class IncidentsMixin(JournalStoreBase):
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("SELECT media_revision, revision FROM events WHERE event_id = ?;", (event_id,))
+            cur.execute(
+                "SELECT media_revision, revision FROM events WHERE event_id = ?;", (event_id,)
+            )
             ev_row = cur.fetchone()
             if not ev_row or ev_row["media_revision"] != expected_media_revision:
                 return None, None
@@ -149,6 +151,116 @@ class IncidentsMixin(JournalStoreBase):
                 cur.execute("ROLLBACK;")
                 raise
 
+    async def renew_annotation_reservation(
+        self,
+        event_id: str,
+        namespace: str,
+        expected_media_revision: int,
+        expected_generation: int,
+        worker_id: str,
+        ttl_seconds: float = 180.0,
+    ) -> bool:
+        """Atomically renew an existing non-terminal event annotation reservation without bumping generation."""
+        validate_safe_id(event_id, "event_id")
+        validate_bounded_string(namespace, "namespace")
+        validate_bounded_string(worker_id, "worker_id")
+        validate_finite_number(ttl_seconds, "ttl_seconds", min_val=0.0, allow_zero=False)
+        if (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 1
+        ):
+            return False
+
+        return await asyncio.to_thread(
+            self._sync_renew_annotation_reservation,
+            event_id,
+            namespace,
+            expected_media_revision,
+            expected_generation,
+            worker_id,
+            ttl_seconds,
+        )
+
+    def _sync_renew_annotation_reservation(
+        self,
+        event_id: str,
+        namespace: str,
+        expected_media_revision: int,
+        expected_generation: int,
+        worker_id: str,
+        ttl_seconds: float,
+    ) -> bool:
+        now_dt = utc_now()
+        now_str = format_iso(now_dt) or ""
+        new_until_dt = now_dt + timedelta(seconds=ttl_seconds)
+        terminal_statuses = {"complete", "failed", "skipped"}
+
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.cursor()
+            cur.execute("SELECT media_revision FROM events WHERE event_id = ?;", (event_id,))
+            ev_row = cur.fetchone()
+            if not ev_row or ev_row["media_revision"] != expected_media_revision:
+                return False
+
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute(
+                    """
+                    SELECT generation, status, reserved_until, expected_media_revision
+                    FROM annotations
+                    WHERE event_id = ? AND namespace = ?;
+                    """,
+                    (event_id, namespace),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                if existing["generation"] != expected_generation:
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                if existing["expected_media_revision"] != expected_media_revision:
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                if existing["status"] in terminal_statuses:
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                effective_until_dt = new_until_dt
+                if existing.get("reserved_until"):
+                    try:
+                        existing_until_dt = ensure_utc(existing["reserved_until"])
+                        if existing_until_dt > effective_until_dt:
+                            effective_until_dt = existing_until_dt
+                    except Exception:
+                        pass
+
+                reserved_until = format_iso(effective_until_dt) or ""
+                cur.execute(
+                    """
+                    UPDATE annotations
+                    SET reserved_by = ?, reserved_until = ?, updated_at = ?
+                    WHERE event_id = ? AND namespace = ?;
+                    """,
+                    (
+                        worker_id,
+                        reserved_until,
+                        now_str,
+                        event_id,
+                        namespace,
+                    ),
+                )
+                cur.execute("COMMIT;")
+                return True
+            except Exception:
+                cur.execute("ROLLBACK;")
+                raise
+
     async def set_annotation_cas(
         self,
         event_id: str,
@@ -167,7 +279,11 @@ class IncidentsMixin(JournalStoreBase):
         validate_payload_json(payload, "payload")
         if expected_generation is None:
             return False
-        if isinstance(expected_generation, bool) or not isinstance(expected_generation, int) or expected_generation < 1:
+        if (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 1
+        ):
             return False
 
         res, notify_tuple = await asyncio.to_thread(
@@ -821,6 +937,117 @@ class IncidentsMixin(JournalStoreBase):
                 cur.execute("ROLLBACK;")
                 raise
 
+    async def renew_incident_annotation_reservation(
+        self,
+        incident_id: str,
+        namespace: str,
+        expected_generation: int,
+        expected_input_token: str,
+        profile_digest: str,
+        worker_id: str | None = None,
+        ttl_seconds: float = 60.0,
+    ) -> bool:
+        """Atomically renew an existing incident annotation reservation without bumping generation."""
+        validate_safe_id(incident_id, "incident_id")
+        validate_bounded_string(namespace, "namespace")
+        validate_bounded_string(expected_input_token, "expected_input_token")
+        validate_bounded_string(profile_digest, "profile_digest", max_len=256, allow_none=False)
+        validate_finite_number(ttl_seconds, "ttl_seconds", min_val=0.1, allow_zero=False)
+        if (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 1
+        ):
+            return False
+
+        return await asyncio.to_thread(
+            self._sync_renew_incident_annotation_reservation,
+            incident_id,
+            namespace,
+            expected_generation,
+            expected_input_token,
+            profile_digest,
+            worker_id,
+            ttl_seconds,
+        )
+
+    def _sync_renew_incident_annotation_reservation(
+        self,
+        incident_id: str,
+        namespace: str,
+        expected_generation: int,
+        expected_input_token: str,
+        profile_digest: str,
+        worker_id: str | None,
+        ttl_seconds: float,
+    ) -> bool:
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute("SELECT 1 FROM incidents WHERE incident_id = ?;", (incident_id,))
+                if not cur.fetchone():
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                cur.execute(
+                    """
+                    SELECT generation, input_token, input_namespace, profile_digest, status, worker_id, reserved_until
+                    FROM incident_annotations
+                    WHERE incident_id = ? AND namespace = ?;
+                    """,
+                    (incident_id, namespace),
+                )
+                row = cur.fetchone()
+                if not row or row["generation"] != expected_generation:
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                if row["status"] != "reserved":
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                if (
+                    row["input_token"] != expected_input_token
+                    or row["profile_digest"] != profile_digest
+                ):
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                input_ns = row["input_namespace"]
+                fresh_token = self._sync_compute_incident_input_token(cur, incident_id, input_ns)
+                if fresh_token != expected_input_token:
+                    cur.execute("ROLLBACK;")
+                    return False
+
+                now_dt = utc_now()
+                now_str = format_iso(now_dt) or ""
+                effective_until_dt = now_dt + timedelta(seconds=ttl_seconds)
+                if row["reserved_until"]:
+                    try:
+                        existing_until_dt = ensure_utc(row["reserved_until"])
+                        if existing_until_dt > effective_until_dt:
+                            effective_until_dt = existing_until_dt
+                    except Exception:
+                        pass
+
+                lease_until = format_iso(effective_until_dt) or ""
+                eff_worker = worker_id if worker_id is not None else row["worker_id"]
+                cur.execute(
+                    """
+                    UPDATE incident_annotations
+                    SET worker_id = ?, reserved_until = ?, updated_at = ?
+                    WHERE incident_id = ? AND namespace = ?;
+                    """,
+                    (eff_worker, lease_until, now_str, incident_id, namespace),
+                )
+                cur.execute("COMMIT;")
+                return True
+            except Exception:
+                cur.execute("ROLLBACK;")
+                raise
+
     async def set_incident_annotation_cas(
         self,
         incident_id: str,
@@ -1082,7 +1309,9 @@ class IncidentsMixin(JournalStoreBase):
                 tags.append(f"group={correlation_group.strip()}")
             if zone and zone.strip():
                 tags.append(f"zone={zone.strip()}")
-            create_reason = f"auto_association:{':'.join(tags)}" if tags else "auto_association:isolated"
+            create_reason = (
+                f"auto_association:{':'.join(tags)}" if tags else "auto_association:isolated"
+            )
             inc, _, _notify = self._sync_create_or_join_incident(
                 cur, new_inc_id, event_id, create_reason
             )
