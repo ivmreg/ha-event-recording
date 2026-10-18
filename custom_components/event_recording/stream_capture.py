@@ -159,6 +159,15 @@ async def async_record_stream(
     heartbeat_error: BaseException | None = None
     setup_done_at: float | None = None
 
+    _LOGGER.debug(
+        "Starting shared HLS stream capture for %s: duration=%.2fs, lookback=%.2fs, target_duration=%.2fs, watchdog_budget=%.2fs",
+        camera_entity,
+        duration_seconds,
+        lookback_seconds,
+        target_duration,
+        hard_deadline - started_at,
+    )
+
     def raise_capture_timeout() -> None:
         now = loop.time()
         elapsed_setup = (
@@ -255,6 +264,14 @@ async def async_record_stream(
             incomplete = [s for s in boundary_segments if not s.complete]
             last_sequence = int(incomplete[0].sequence) - 1 if incomplete else None
 
+        _LOGGER.debug(
+            "Lookback analysis for %s: boundary_count=%d, lookback_count=%d, last_sequence=%s",
+            camera_entity,
+            len(boundary_segments),
+            len(selected),
+            last_sequence,
+        )
+
         # Drain eligible historical segments first, in order.
         for segment in selected:
             check_provider()
@@ -264,6 +281,12 @@ async def async_record_stream(
                 hass, writer.write_segment, await _snapshot_segment(hass, segment)
             )
             written_segments += 1
+            _LOGGER.debug(
+                "Wrote lookback segment %s for %s: duration=%.2fs",
+                segment.sequence,
+                camera_entity,
+                segment.duration,
+            )
 
         setup_done_at = loop.time()
 
@@ -290,6 +313,15 @@ async def async_record_stream(
                 written_segments += 1
                 captured_live_duration += snapshot.duration
                 completed_live_segments += 1
+                _LOGGER.debug(
+                    "Wrote live segment %s for %s: seg_dur=%.2fs, captured_live=%.2fs/%.2fs (total written=%d)",
+                    segment.sequence,
+                    camera_entity,
+                    snapshot.duration,
+                    captured_live_duration,
+                    duration_seconds,
+                    written_segments,
+                )
 
             if captured_live_duration >= duration_seconds:
                 break
@@ -297,6 +329,11 @@ async def async_record_stream(
             remaining = capture_deadline - loop.time()
             if remaining <= 0:
                 raise_capture_timeout()
+            _LOGGER.debug(
+                "Waiting for next HLS segment for %s: remaining_budget=%.2fs",
+                camera_entity,
+                remaining,
+            )
             try:
                 await asyncio.wait_for(hls.recv(), timeout=min(heartbeat_interval, remaining))
             except TimeoutError:
@@ -305,6 +342,12 @@ async def async_record_stream(
         check_provider()
         # A whole-segment capture can exceed the requested duration slightly.
         result = await _await_executor_job(hass, writer.finish)
+        _LOGGER.debug(
+            "Stream capture finished cleanly for %s: total_written=%d, live_duration=%.2fs",
+            camera_entity,
+            written_segments,
+            captured_live_duration,
+        )
         return result
     except StreamCaptureError as err:
         if writer is not None and written_segments > 0:
@@ -314,6 +357,12 @@ async def async_record_stream(
                 raise err from None
             result = dict(res) if isinstance(res, dict) else {}
             result["partial_error"] = getattr(err, "code", STREAM_CAPTURE_FAILED)
+            _LOGGER.debug(
+                "Stream capture partial recovery for %s: written=%d, error=%s",
+                camera_entity,
+                written_segments,
+                result.get("partial_error"),
+            )
             return result
         raise
     except asyncio.CancelledError as err:
@@ -338,11 +387,18 @@ async def async_record_stream(
                 if not heartbeat.cancelled():
                     _ = heartbeat.exception()
         finally:
-            if writer is not None:
-                try:
-                    await _await_executor_job(hass, writer.close)
-                except asyncio.CancelledError as err:
-                    if cancellation is None:
-                        cancellation = err
+            try:
+                if writer is not None:
+                    try:
+                        await _await_executor_job(hass, writer.close)
+                    except asyncio.CancelledError as err:
+                        if cancellation is None:
+                            cancellation = err
+            finally:
+                _LOGGER.debug(
+                    "Stream capture cleanup complete for %s (elapsed=%.2fs)",
+                    camera_entity,
+                    loop.time() - started_at,
+                )
             if cancellation is not None:
                 raise cancellation

@@ -21,6 +21,7 @@ from .const import (
     CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
     CONF_CHUNK_SECONDS,
     CONF_ENABLE_AUTO_ASSOCIATION,
+    CONF_ENABLE_DEBUG_LOGGING,
     CONF_EXPORT_DELAY_SECONDS,
     CONF_FRIGATE_AUTH_TOKEN,
     CONF_FRIGATE_BASE_URL,
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
     DEFAULT_CHUNK_SECONDS,
     DEFAULT_ENABLE_AUTO_ASSOCIATION,
+    DEFAULT_ENABLE_DEBUG_LOGGING,
     DEFAULT_EXPORT_DELAY_SECONDS,
     DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
     DEFAULT_MAX_PARALLEL_RESOURCES,
@@ -213,6 +215,10 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 user_input[CONF_ENABLE_AUTO_ASSOCIATION] = bool(
                     user_input[CONF_ENABLE_AUTO_ASSOCIATION]
                 )
+            if CONF_ENABLE_DEBUG_LOGGING in user_input:
+                user_input[CONF_ENABLE_DEBUG_LOGGING] = bool(
+                    user_input[CONF_ENABLE_DEBUG_LOGGING]
+                )
             for field, spec, err_key in (
                 (
                     CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
@@ -273,6 +279,10 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
             ),
         )
+        current_debug_logging = entry.options.get(
+            CONF_ENABLE_DEBUG_LOGGING,
+            entry.data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING),
+        )
 
         schema = vol.Schema(
             {
@@ -295,6 +305,9 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 vol.Required(
                     CONF_MAX_INCIDENT_SPAN_SECONDS, default=float(current_max_span)
                 ): number_spec_selector(SPEC_MAX_INCIDENT_SPAN_SECONDS, step=10.0),
+                vol.Required(
+                    CONF_ENABLE_DEBUG_LOGGING, default=bool(current_debug_logging)
+                ): bool,
             }
         )
 

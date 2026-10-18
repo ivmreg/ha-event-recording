@@ -16,17 +16,21 @@ if TYPE_CHECKING:
 
 from .const import (
     CARD_URL_PATH,
+    CONF_ENABLE_DEBUG_LOGGING,
     CONF_MEDIA_ROOT,
     DATA_API,
     DATA_COORDINATOR,
     DATA_REGISTRY,
     DATA_SETUP_DONE,
     DATA_STORE,
+    DEFAULT_ENABLE_DEBUG_LOGGING,
     DEFAULT_MEDIA_DIR,
     DOMAIN,
 )
+from .logging_util import configure_integration_logging
 
 _LOGGER = logging.getLogger(__name__)
+
 
 __all__ = [
     "DOMAIN",
@@ -34,6 +38,7 @@ __all__ = [
     "async_setup",
     "async_setup_entry",
     "async_unload_entry",
+    "configure_integration_logging",
 ]
 
 
@@ -109,6 +114,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     def get_val(key: str, default: Any) -> Any:
         return options.get(key, data.get(key, default))
+
+    configure_integration_logging(
+        bool(get_val(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING))
+    )
 
     raw_media_dir = str(get_val(CONF_MEDIA_ROOT, DEFAULT_MEDIA_DIR)).strip()
     from .config_flow import validate_media_root
@@ -229,4 +238,12 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
     # Entry options are read dynamically by retention properties and profile lookup.
     coordinator.entry = entry
+    configure_integration_logging(
+        bool(
+            entry.options.get(
+                CONF_ENABLE_DEBUG_LOGGING,
+                entry.data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING),
+            )
+        )
+    )
     await coordinator.set_max_parallel_resources(coordinator.max_parallel_resources)

@@ -18,6 +18,7 @@ CONF_QUEUE_WAIT_TIMEOUT_SECONDS = "queue_wait_timeout_seconds"
 CONF_MIN_DISK_FREE_MB = "min_disk_free_mb"
 CONF_RECORDING_MODE = "recording_mode"
 CONF_OWNERSHIP_GROUP = "ownership_group"
+CONF_ENABLE_DEBUG_LOGGING = "enable_debug_logging"
 
 # Frigate buffered provider configuration keys
 CONF_FRIGATE_BASE_URL = "frigate_base_url"
@@ -51,6 +52,7 @@ DEFAULT_ENABLE_AUTO_ASSOCIATION = False
 DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS = 10.0
 DEFAULT_MAX_INCIDENT_SPAN_SECONDS = 300.0
 DEFAULT_WATCHDOG_PADDING_SECONDS = 15.0
+DEFAULT_ENABLE_DEBUG_LOGGING = False
 MAX_PARALLEL_RESOURCES = 2
 
 # Recording modes

@@ -126,7 +126,11 @@ class DynamicSlotManager:
     async def set_capacity(self, new_capacity: int) -> None:
         """Hot-adjust capacity without interrupting active holders."""
         async with self._cond:
+            old_cap = self._capacity
             self._capacity = max(1, min(8, int(new_capacity)))
+            _LOGGER.debug(
+                "DynamicSlotManager capacity adjusted: %d -> %d", old_cap, self._capacity
+            )
             self._cond.notify_all()
 
     async def set_max_queue_depth(self, new_depth: int) -> None:
@@ -145,11 +149,23 @@ class DynamicSlotManager:
                     f"Queue depth limit ({self._max_queue_depth}) exceeded"
                 )
             self._waiting += 1
+            _LOGGER.debug(
+                "DynamicSlotManager.acquire called: active=%d, waiting=%d, effective_capacity=%d, timeout=%s",
+                self._active,
+                self._waiting,
+                self.effective_capacity,
+                timeout_seconds,
+            )
             try:
                 if timeout_seconds is None:
                     while self._active >= self.effective_capacity:
                         await self._cond.wait()
                     self._active += 1
+                    _LOGGER.debug(
+                        "DynamicSlotManager.acquire granted: active=%d, waiting=%d",
+                        self._active,
+                        self._waiting,
+                    )
                     return True
                 else:
                     loop = asyncio.get_running_loop()
@@ -163,6 +179,11 @@ class DynamicSlotManager:
                         except TimeoutError:
                             return False
                     self._active += 1
+                    _LOGGER.debug(
+                        "DynamicSlotManager.acquire granted: active=%d, waiting=%d",
+                        self._active,
+                        self._waiting,
+                    )
                     return True
             finally:
                 self._waiting -= 1
@@ -185,7 +206,14 @@ class DynamicSlotManager:
     async def release(self) -> None:
         """Release a slot."""
         async with self._cond:
+            old_active = self._active
             self._active = max(0, self._active - 1)
+            _LOGGER.debug(
+                "DynamicSlotManager.release: active=%d -> %d, waiting=%d",
+                old_active,
+                self._active,
+                self._waiting,
+            )
             self._cond.notify_all()
 
 
@@ -347,6 +375,13 @@ class RecordingCoordinator:
 
     async def start(self) -> None:
         """Start the coordinator worker and reconcile store."""
+        _LOGGER.debug(
+            "RecordingCoordinator starting: worker_id=%s, max_parallel=%d, max_queue_depth=%d, chunk_seconds=%d",
+            self.worker_id,
+            self.max_parallel_resources,
+            self.max_queue_depth,
+            self.chunk_seconds,
+        )
         if hasattr(self.registry, "bind_ledger"):
             self.registry.bind_ledger(self.store.storage_ledger)
         # Adopt any surviving quarantined reservations from registry
@@ -367,6 +402,10 @@ class RecordingCoordinator:
 
     async def stop(self) -> None:
         """Stop coordinator gracefully without cancelling quarantined background native writers."""
+        _LOGGER.debug(
+            "RecordingCoordinator stopping: active_resource_tasks=%d",
+            len(self._resource_tasks),
+        )
         if hasattr(self.registry, "unregister_settled_callback"):
             self.registry.unregister_settled_callback(self._slot_manager.notify_capacity_changed)
         if hasattr(self.registry, "unbind_ledger"):
@@ -418,6 +457,8 @@ class RecordingCoordinator:
         intents = await self.store.lease_record_intents(
             worker_id=self.worker_id, limit=16, lease_seconds=30.0
         )
+        if intents:
+            _LOGGER.debug("RecordingCoordinator leased %d intent(s)", len(intents))
         for intent in intents:
             if intent.operation == "stop":
                 await self.session_coordinator.handle_stop_intent(intent.resource_key)
@@ -450,6 +491,11 @@ class RecordingCoordinator:
                     continue
 
                 self._pending_resources.discard(r_key)
+                _LOGGER.debug(
+                    "Spawning capture task for resource %s (event_id=%s)",
+                    r_key,
+                    session.active_event_id,
+                )
                 task = asyncio.create_task(
                     self._run_resource_capture(r_key),
                     name=f"event_recording_capture_{r_key}",
@@ -463,6 +509,11 @@ class RecordingCoordinator:
         if now_time - self._retention_at < 60.0:
             return
         self._retention_at = now_time
+        _LOGGER.debug(
+            "Running periodic storage retention pass (max_bytes=%d, max_age_days=%d)",
+            self.max_storage_bytes,
+            self.retention_days,
+        )
 
         try:
             await self.store.enforce_retention(

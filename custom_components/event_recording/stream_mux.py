@@ -162,6 +162,12 @@ class StreamMuxWriter:
         self._packets_written: int = 0
         self._closed: bool = False
         self._epoch_shift_seconds = Fraction(0)
+        _LOGGER.debug(
+            "StreamMuxWriter initialized for %s (min_seg_dur=%.2fs, orientation=%s)",
+            self.target_path.name,
+            min_segment_duration,
+            orientation,
+        )
 
     def write_segment(self, segment: SegmentSnapshot) -> None:
         """Demux and remux a segment snapshot into the output container."""
@@ -383,10 +389,18 @@ class StreamMuxWriter:
             # Apply orientation matrix if needed
             self._apply_orientation_and_rename()
 
+            size = self.target_path.stat().st_size if self.target_path.is_file() else 0
+            _LOGGER.debug(
+                "StreamMuxWriter finished for %s: packets=%d, size_bytes=%d",
+                self.target_path.name,
+                self._packets_written,
+                size,
+            )
+
             return {
                 "packets_written": self._packets_written,
                 "target_path": str(self.target_path),
-                "size_bytes": self.target_path.stat().st_size if self.target_path.is_file() else 0,
+                "size_bytes": size,
             }
         finally:
             self.close()

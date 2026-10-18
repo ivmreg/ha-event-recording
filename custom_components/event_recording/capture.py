@@ -104,6 +104,12 @@ class CaptureExecutor:
         self, event_id: str, valid_clips_count: int, error: str | None
     ) -> None:
         """Conclude capture state adhering strictly to invariant: zero clips CANNOT be ready."""
+        _LOGGER.debug(
+            "Finishing capture for event %s: valid_clips=%d, error=%s",
+            event_id,
+            valid_clips_count,
+            error,
+        )
         if valid_clips_count == 0:
             terminal_error = error or "ZERO_CLIPS_RECORDED"
             await self.store.update_capture_state(event_id, "failed", error_code=terminal_error)
@@ -136,6 +142,13 @@ class CaptureExecutor:
         )
         ownership_group = profile_snapshot.get("ownership_group") or session_config.get(
             "ownership_group"
+        )
+        _LOGGER.debug(
+            "Starting run_resource_capture for %s (event_id=%s, mode=%s, ownership_group=%s)",
+            resource_key,
+            event_id,
+            recording_mode,
+            ownership_group,
         )
 
         is_expired, deadline_seconds, scene_deadline = (
@@ -304,6 +317,16 @@ class CaptureExecutor:
                 staging_path = staging_dir / f"{event_id}_{uuid.uuid4().hex[:8]}.mp4"
                 sidecar_tmp = Path(str(staging_path) + ".tmp")
 
+                _LOGGER.debug(
+                    "Planning capture chunk for %s (event_id=%s): chunk_dur=%.2fs, lookback=%.2fs, remaining=%.2fs, res_id=%s",
+                    resource_key,
+                    event_id,
+                    chunk_dur,
+                    lookback,
+                    remaining,
+                    res_id,
+                )
+
                 try:
                     await self.store.reserve_in_flight(
                         res_id, staging_path, chunk_reservation, sidecar_paths=(sidecar_tmp,)
@@ -400,6 +423,13 @@ class CaptureExecutor:
                                 adopt_staging=True,
                             )
                             valid_clips_count += 1
+                            _LOGGER.debug(
+                                "Promoted media chunk for %s (event_id=%s, size=%d bytes, valid_clips=%d)",
+                                resource_key,
+                                event_id,
+                                file_size,
+                                valid_clips_count,
+                            )
                             if partial_error:
                                 break
                         except Exception as prom_err:

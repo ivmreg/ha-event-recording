@@ -44,7 +44,8 @@
           "queue_wait_timeout_seconds": "Queue Wait Timeout (seconds)",
           "enable_auto_association": "Enable Cross-Camera Auto-Association (Default OFF)",
           "auto_association_tolerance_seconds": "Auto-Association Time Tolerance (seconds, 1.0-60.0)",
-          "max_incident_span_seconds": "Maximum Incident Span (seconds, 10.0-3600.0)"
+          "max_incident_span_seconds": "Maximum Incident Span (seconds, 10.0-3600.0)",
+          "enable_debug_logging": "Enable diagnostic debug logging"
         }
       },
       "storage_settings": {

@@ -127,6 +127,12 @@ async def ws_handle_events(
     api = get_api(hass)
     limit = max(1, min(int(msg.get("limit", 50)), 100))
     cursor = msg.get("before_cursor") or msg.get("cursor")
+    _LOGGER.debug(
+        "WS command event_recording/events: limit=%d, cursor=%s, filters=%s",
+        limit,
+        cursor,
+        {k: v for k, v in msg.items() if k not in ("type", "id", "limit", "cursor", "before_cursor")},
+    )
 
     filters: dict[str, Any] = {}
     if "source_id" in msg:
@@ -225,6 +231,7 @@ async def ws_handle_event(
         return
 
     event_id = msg["event_id"]
+    _LOGGER.debug("WS command event_recording/event query for event_id=%s", event_id)
     event = await store.get_event(event_id)
     if not event:
         connection.send_error(msg["id"], "not_found", f"Event '{event_id}' not found")

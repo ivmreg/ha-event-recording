@@ -6,6 +6,7 @@ storage accounting, and quarantined resources with zero paths, credentials, or r
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -17,6 +18,7 @@ from .const import (
     CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
     CONF_CHUNK_SECONDS,
     CONF_ENABLE_AUTO_ASSOCIATION,
+    CONF_ENABLE_DEBUG_LOGGING,
     CONF_MAX_INCIDENT_SPAN_SECONDS,
     CONF_MAX_PARALLEL_RESOURCES,
     CONF_MAX_QUEUE_DEPTH,
@@ -30,6 +32,7 @@ from .const import (
     DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
     DEFAULT_CHUNK_SECONDS,
     DEFAULT_ENABLE_AUTO_ASSOCIATION,
+    DEFAULT_ENABLE_DEBUG_LOGGING,
     DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
     DEFAULT_MAX_PARALLEL_RESOURCES,
     DEFAULT_MAX_QUEUE_DEPTH,
@@ -81,6 +84,12 @@ async def async_get_config_entry_diagnostics(
             _get_setting(
                 CONF_MAX_INCIDENT_SPAN_SECONDS, DEFAULT_MAX_INCIDENT_SPAN_SECONDS
             )
+        ),
+        CONF_ENABLE_DEBUG_LOGGING: bool(
+            _get_setting(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING)
+        ),
+        "effective_log_level": logging.getLevelName(
+            logging.getLogger("custom_components.event_recording").getEffectiveLevel()
         ),
     }
 
@@ -195,6 +204,14 @@ async def async_get_config_entry_diagnostics(
 
     return {
         "config": config_diagnostics,
+        "logging": {
+            CONF_ENABLE_DEBUG_LOGGING: bool(
+                _get_setting(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING)
+            ),
+            "effective_log_level": logging.getLevelName(
+                logging.getLogger("custom_components.event_recording").getEffectiveLevel()
+            ),
+        },
         "camera_profiles": safe_profiles,
         "slots": slots_info,
         "counters": counters_info,

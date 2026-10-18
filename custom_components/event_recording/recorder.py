@@ -78,6 +78,10 @@ class RecorderRegistry:
 
     def _notify_settled(self) -> None:
         """Notify registered listeners when quarantined task settles or capacity changes."""
+        _LOGGER.debug(
+            "Quarantine settled notification dispatched to %d listeners",
+            len(self._settled_callbacks),
+        )
         for cb in list(self._settled_callbacks):
             try:
                 cb()
@@ -329,6 +333,14 @@ class RecorderRegistry:
             res_id = getattr(reservation, "reservation_id", str(reservation))
             self._quarantined_reservations[res_id] = reservation
 
+        _LOGGER.debug(
+            "Quarantining resource %s (active_count=%d, quarantined_count=%d, group=%s)",
+            camera_entity,
+            len(self.active_resources),
+            len(self.quarantined_resources),
+            g_key,
+        )
+
         def _consume(t: asyncio.Task[Any]) -> None:
             try:
                 t.exception()
@@ -382,6 +394,13 @@ class RecorderRegistry:
         deadline = loop.time() + max(0.1, timeout_seconds)
         acquired_locks: list[asyncio.Lock] = []
 
+        _LOGGER.debug(
+            "Acquiring locks for %s (keys=%s, timeout=%.2fs)",
+            camera_entity,
+            sorted_keys,
+            timeout_seconds,
+        )
+
         try:
             for k in sorted_keys:
                 lock = self.get_lock(k)
@@ -401,10 +420,17 @@ class RecorderRegistry:
                 raise ResourceQuarantinedError(
                     f"Resource '{camera_entity}' is quarantined awaiting previous task release."
                 )
+            _LOGGER.debug("Acquired locks for %s (keys=%s)", camera_entity, sorted_keys)
             yield
         finally:
             for lock in reversed(acquired_locks):
                 lock.release()
+            _LOGGER.debug(
+                "Released %d locks for %s (keys=%s)",
+                len(acquired_locks),
+                camera_entity,
+                sorted_keys,
+            )
 
     async def drain(self, timeout_seconds: float = 5.0) -> bool:
         """Wait for all active and quarantined tasks to settle."""
@@ -496,7 +522,21 @@ class CameraRecorderAdapter:
 
             try:
                 watchdog_timeout = max(0.0, watchdog_deadline - loop.time())
-                return await asyncio.wait_for(asyncio.shield(record_task), timeout=watchdog_timeout)
+                _LOGGER.debug(
+                    "CameraRecorderAdapter.record_chunk scheduled for %s: duration=%.2fs, lookback=%.2fs, target=%s, timeout=%.2fs",
+                    camera_entity,
+                    duration_seconds,
+                    lookback_seconds,
+                    resolved_path.name,
+                    watchdog_timeout,
+                )
+                res = await asyncio.wait_for(asyncio.shield(record_task), timeout=watchdog_timeout)
+                _LOGGER.debug(
+                    "CameraRecorderAdapter.record_chunk completed for %s: partial_error=%s",
+                    camera_entity,
+                    res.get("partial_error") if isinstance(res, dict) else None,
+                )
+                return res
             except (asyncio.CancelledError, TimeoutError) as err:
                 if not record_task.done():
                     self.registry.quarantine(camera_entity, record_task, ownership_group)
@@ -608,8 +648,22 @@ class SnapshotRecorderAdapter:
             op_task = asyncio.create_task(_do_snapshot())
             self.registry.register_active(camera_entity, op_task, ownership_group)
 
+            _LOGGER.debug(
+                "Snapshot capture scheduled for %s: target=%s, timeout=%.2fs",
+                camera_entity,
+                resolved_path.name,
+                self.timeout,
+            )
+
             try:
-                return await asyncio.wait_for(asyncio.shield(op_task), timeout=self.timeout)
+                result = await asyncio.wait_for(asyncio.shield(op_task), timeout=self.timeout)
+                _LOGGER.debug(
+                    "Snapshot capture completed for %s: size_bytes=%d, mime_type=%s",
+                    camera_entity,
+                    result.get("size_bytes", 0),
+                    result.get("mime_type"),
+                )
+                return result
             except (asyncio.CancelledError, TimeoutError) as err:
                 if not op_task.done():
                     self.registry.quarantine(camera_entity, op_task, ownership_group)

@@ -230,6 +230,13 @@ def async_register_services(hass: HomeAssistant) -> None:
         payload = data.get("payload") or {}
         access_entities = tuple(data.get("access_entities") or ())
 
+        _LOGGER.debug(
+            "service event_recording.log_event called for source %s (kind=%s, label=%s)",
+            source_id,
+            kind,
+            label,
+        )
+
         # Security check for human callers on explicit access entities
         if access_entities and call.context.user_id is not None:
             await _check_human_permission(hass, call, access_entities, "control")
@@ -288,6 +295,14 @@ def async_register_services(hass: HomeAssistant) -> None:
         idempotency_key = data.get("idempotency_key") or uuid.uuid4().hex
         correlation_id = data.get("correlation_id")
         lookback_seconds = data.get("lookback_seconds")
+
+        _LOGGER.debug(
+            "service event_recording.record called: resource_key=%s, op=%s, window=%s, lookback=%s",
+            resource_key,
+            operation,
+            window_seconds,
+            lookback_seconds,
+        )
         action_hold: bool | None = data.get("hold") if "hold" in data else None
         action_tail: float | None = (
             float(data["tail_window_seconds"]) if "tail_window_seconds" in data else None
@@ -432,6 +447,11 @@ def async_register_services(hass: HomeAssistant) -> None:
         data = call.data
         shared_correlation_id = data.get("correlation_id") or f"corr_{uuid.uuid4().hex[:12]}"
         validate_correlation_id(shared_correlation_id)
+        _LOGGER.debug(
+            "service event_recording.record_events called: %d events, correlation_id=%s",
+            len(data.get("events", [])),
+            shared_correlation_id,
+        )
 
         top_occurred_at = data.get("occurred_at")
         top_kind = data.get("kind")
@@ -499,6 +519,14 @@ def async_register_services(hass: HomeAssistant) -> None:
         mime_type = data.get("mime_type")
         finalize = bool(data.get("finalize", True))
 
+        _LOGGER.debug(
+            "service event_recording.attach_media called for event %s: kind=%s, mime=%s, finalize=%s",
+            event_id,
+            kind,
+            mime_type,
+            finalize,
+        )
+
         event = await store.get_event(event_id)
         if not event:
             raise HomeAssistantError(f"Event '{event_id}' not found")
@@ -520,6 +548,7 @@ def async_register_services(hass: HomeAssistant) -> None:
             raise HomeAssistantError("Event Recording integration is not initialized")
 
         event_id = call.data["event_id"]
+        _LOGGER.debug("service event_recording.finalize called for event %s", event_id)
         event = await store.get_event(event_id)
         if not event:
             raise HomeAssistantError(f"Event '{event_id}' not found")
