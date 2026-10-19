@@ -19,6 +19,7 @@ MAX_LOOKBACK_SEGMENTS = 50
 _PROVIDER = "hls"
 _HEARTBEAT_SECONDS = 1.0
 _CLEANUP_MARGIN_SECONDS = 0.5
+MIN_LIVE_CAPTURE_RATIO = 0.5
 
 
 class CameraStreamUnavailableError(Exception):
@@ -129,6 +130,7 @@ async def async_record_stream(
     lookback_seconds: float = 0.0,
     watchdog_padding_seconds: float = DEFAULT_WATCHDOG_PADDING_SECONDS,
     watchdog_deadline: float | None = None,
+    min_live_ratio: float = MIN_LIVE_CAPTURE_RATIO,
 ) -> dict[str, Any]:
     """Capture shared HLS segments without consuming or removing the provider."""
     loop = asyncio.get_running_loop()
@@ -139,6 +141,8 @@ async def async_record_stream(
     )
     cleanup_margin = min(_CLEANUP_MARGIN_SECONDS, max(0.0, watchdog_padding_seconds) * 0.1)
     capture_deadline = hard_deadline - cleanup_margin
+    min_live_ratio = max(0.0, min(1.0, min_live_ratio))
+    min_live_duration = duration_seconds * min_live_ratio
 
     camera = _get_camera(hass, camera_entity)
     stream = await camera.async_create_stream()
@@ -294,6 +298,8 @@ async def async_record_stream(
             check_provider()
             wake_provider()
             if loop.time() >= capture_deadline:
+                if captured_live_duration >= min_live_duration:
+                    break
                 raise_capture_timeout()
 
             # Process any segment completed since the last receive before waiting. HA
@@ -328,6 +334,8 @@ async def async_record_stream(
             check_provider()
             remaining = capture_deadline - loop.time()
             if remaining <= 0:
+                if captured_live_duration >= min_live_duration:
+                    break
                 raise_capture_timeout()
             _LOGGER.debug(
                 "Waiting for next HLS segment for %s: remaining_budget=%.2fs",
@@ -342,12 +350,27 @@ async def async_record_stream(
         check_provider()
         # A whole-segment capture can exceed the requested duration slightly.
         result = await _await_executor_job(hass, writer.finish)
-        _LOGGER.debug(
-            "Stream capture finished cleanly for %s: total_written=%d, live_duration=%.2fs",
-            camera_entity,
-            written_segments,
-            captured_live_duration,
-        )
+        if captured_live_duration < duration_seconds:
+            result = dict(result) if isinstance(result, dict) else {}
+            shortfall = max(0.0, round(duration_seconds - captured_live_duration, 4))
+            result["captured_live_duration"] = captured_live_duration
+            result["requested_duration"] = duration_seconds
+            result["duration_shortfall"] = shortfall
+            _LOGGER.info(
+                "Shared stream capture accepted at deadline with relaxed duration: "
+                "captured_live=%.2fs, requested_live=%.2fs (shortfall=%.2fs), total_written=%d",
+                captured_live_duration,
+                duration_seconds,
+                shortfall,
+                written_segments,
+            )
+        else:
+            _LOGGER.debug(
+                "Stream capture finished cleanly for %s: total_written=%d, live_duration=%.2fs",
+                camera_entity,
+                written_segments,
+                captured_live_duration,
+            )
         return result
     except StreamCaptureError as err:
         if writer is not None and written_segments > 0:
