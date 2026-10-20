@@ -26,10 +26,11 @@
     "step": {
       "init": {
         "title": "Event Recording Options",
-        "description": "Manage storage settings, recording concurrency, and optional camera recording defaults.\n\nKnown Limitations:\n- Native lookback may reuse an active HLS buffer, but is best effort; cold streams may have no pre-roll. An external retained-video provider (for example Frigate) is optional.\n- Snapshot mode captures still images only.\n- Storage capacity admission failures return STORAGE_CAPACITY_EXCEEDED; only writers unsettled after timeout or cancellation are quarantined.\n- event.start_at is the logical requested-window start (occurred_at minus requested lookback), not intake time or verified image UTC.\n- This integration serializes its own writers; unrelated camera.record callers can still collide.\n- Storage-root migration UI and grouped-card timeline presentation are deferred.",
+        "description": "Manage storage settings, recording concurrency, and optional camera recording defaults.\n\nKnown Limitations:\n- Native lookback may reuse an active HLS buffer, but is best effort; cold streams may have no pre-roll. An external retained-video provider (for example Frigate) is optional.\n- Snapshot mode captures still images only.\n- Storage capacity admission failures return STORAGE_CAPACITY_EXCEEDED; only writers unsettled after timeout or cancellation are quarantined.\n- event.start_at is the logical requested-window start (occurred_at minus requested lookback), not intake time or verified image UTC.\n- This integration serializes its own writers; unrelated camera.record callers can still collide.\n- Storage-root migration UI and grouped-card timeline presentation are deferred.\n\ngo2rtc maintains a bounded video-only HLS buffer for pre-event capture. It warms after startup or reconnect, may report unavailable pre-roll, and repeated chunks can have gaps.",
         "menu_options": {
           "recording_settings": "Recording Concurrency & Queue",
           "storage_settings": "Storage & Retention Limits",
+          "go2rtc_settings": "go2rtc Connection",
           "cameras": "Camera Profiles",
           "effective_config": "Effective Configuration Summary"
         }
@@ -57,9 +58,19 @@
           "min_disk_free_mb": "Minimum Free Disk Space (MB, floor 50)"
         }
       },
+      "go2rtc_settings": {
+        "title": "go2rtc Connection",
+        "description": "Configure the shared go2rtc HTTP(S) endpoint and optional Basic authentication. The integration does not test or discover the endpoint.",
+        "data": {
+          "go2rtc_base_url": "go2rtc Base URL",
+          "go2rtc_username": "Username (optional)",
+          "go2rtc_password": "Password (optional)",
+          "clear_go2rtc_password": "Clear saved password"
+        }
+      },
       "effective_config": {
         "title": "Effective Configuration Summary",
-        "description": "Current effective operational settings:\n\n- Configuration Precedence: {precedence}\n- Resolved Storage Root: {media_root}\n- Estimated Byte Rate: {rate_estimate}\n- Watchdog Timeout Formula: {watchdog_formula}\n- Hard Cap Safeguard: {hard_cap_behavior}\n- Chunk Duration: {chunk_seconds}s\n- Concurrency Limit: {max_parallel}\n- Queue Capacity: {max_queue_depth} (timeout: {queue_timeout}s)\n- Retention: {retention_size_mb} MB / {retention_days} days\n- Disk Free Floor: {min_disk_free_mb} MB\n- Configured Camera Profiles: {profiles_count}\n- Auto-Association: {auto_association}\n\nKnown Limitations:\n- Native lookback may reuse an active HLS buffer; best effort only\n- Snapshot mode stores static still images only\n- Storage admission failures return STORAGE_CAPACITY_EXCEEDED; only unsettled timed-out/cancelled writers are quarantined\n- Visual UTC timestamps may remain unknown without calibrated provider clocks\n- Storage root migration UI and grouped-card display deferred"
+        "description": "Current effective operational settings:\n\n- Configuration Precedence: {precedence}\n- Resolved Storage Root: {media_root}\n- Estimated Byte Rate: {rate_estimate}\n- Watchdog Timeout Formula: {watchdog_formula}\n- Hard Cap Safeguard: {hard_cap_behavior}\n- Chunk Duration: {chunk_seconds}s\n- Concurrency Limit: {max_parallel}\n- Queue Capacity: {max_queue_depth} (timeout: {queue_timeout}s)\n- Retention: {retention_size_mb} MB / {retention_days} days\n- Disk Free Floor: {min_disk_free_mb} MB\n- Configured Camera Profiles: {profiles_count}\n- Auto-Association: {auto_association}\n\nKnown Limitations:\n- Native lookback may reuse an active HLS buffer; best effort only\n- Snapshot mode stores static still images only\n- Storage admission failures return STORAGE_CAPACITY_EXCEEDED; only unsettled timed-out/cancelled writers are quarantined\n- Visual UTC timestamps may remain unknown without calibrated provider clocks\n- Storage root migration UI and grouped-card display deferred\n\ngo2rtc buffers video-only HLS fragments in bounded memory; startup warm-up and outages can shorten pre-roll, and repeated chunks can have gaps."
       },
       "cameras": {
         "title": "Camera Profiles",
@@ -84,6 +95,8 @@
           "source_id": "Source ID",
           "label": "Display Name",
           "recording_mode": "Recording Capture Mode",
+          "recording_provider": "Recording Provider",
+          "go2rtc_stream": "go2rtc Stream Alias",
           "ownership_group": "Stream Ownership Group (Optional)",
           "window_seconds": "Default Recording Window (seconds)",
           "lookback_seconds": "Lookback (seconds)",
@@ -101,7 +114,9 @@
         },
         "data_description": {
           "source_id": "Stable identifier used to group this camera's events in the timeline.",
-          "recording_mode": "Capture mode: extend (continuous chunked), native_fixed (single clip), native_snapshot (still image), or buffered (provider export).",
+          "recording_mode": "Capture lifecycle: extend (repeated bounded chunks), native_fixed (one clip), native_snapshot (still image), or buffered (Frigate export). go2rtc supports extend and native_fixed only.",
+          "recording_provider": "Home Assistant is the default. go2rtc continuously buffers video-only fMP4 fragments in bounded memory for pre-event capture.",
+          "go2rtc_stream": "Named stream alias configured in go2rtc. A continuous video-only fMP4 buffer supplies available pre-event fragments; after restart it warms again and shortfalls are recorded as partial.",
           "ownership_group": "Optional group identifier for cameras sharing the same physical stream to prevent parallel stream concurrency.",
           "window_seconds": "The default duration requested when an automation records this camera.",
           "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments.",
@@ -116,7 +131,8 @@
         "title": "Choose Camera Profile to Edit",
         "data": {
           "camera_entity": "Camera Profile"
-        }
+        },
+        "description": ""
       },
       "camera_edit_profile": {
         "title": "Edit Camera Profile",
@@ -153,7 +169,8 @@
         "title": "Choose Camera Profile to Remove",
         "data": {
           "camera_entity": "Camera Profile"
-        }
+        },
+        "description": ""
       },
       "camera_remove_confirm": {
         "title": "Remove Camera Profile",
@@ -177,6 +194,9 @@
       "invalid_max_window_seconds": "Maximum window must be a whole number from 1 to 300 seconds.",
       "max_window_below_window": "Maximum recording window must be at least the default recording window.",
       "invalid_recording_mode": "Recording mode must be extend, native_fixed, native_snapshot, or buffered.",
+      "invalid_recording_provider": "Choose Home Assistant or go2rtc as the recording provider.",
+      "go2rtc_unsupported_recording_mode": "go2rtc supports only extend and native_fixed recording modes.",
+      "invalid_go2rtc_stream": "Enter a named go2rtc stream alias using letters, numbers, dots, underscores, or hyphens.",
       "invalid_ownership_group": "Ownership group identifier must not exceed 64 characters and cannot contain control characters.",
       "invalid_max_queue_depth": "Queue depth must be a whole number from 1 to 256.",
       "invalid_max_parallel": "Max parallel recordings must be between 1 and 8.",
@@ -186,7 +206,9 @@
       "retention_days_too_low": "Retention days must be at least 1 day.",
       "invalid_frigate_base_url": "Frigate base URL must start with http:// or https://.",
       "invalid_frigate_camera_name": "Frigate camera name must contain only alphanumeric characters, underscores, and hyphens.",
-      "invalid_export_delay_seconds": "Export delay must be a whole number from 0 to 60 seconds."
+      "invalid_export_delay_seconds": "Export delay must be a whole number from 0 to 60 seconds.",
+      "invalid_go2rtc_base_url": "Enter an HTTP or HTTPS base URL without credentials, query, or fragment.",
+      "go2rtc_credentials_incomplete": "Enter both a username and password, or clear the saved password."
     },
     "abort": {
       "remove_cancelled": "Camera profile removal was cancelled.",

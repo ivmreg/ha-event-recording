@@ -13,7 +13,8 @@ This document describes operational limitations and architectural boundaries of 
 ---
 
 ## 2. Pre-Trigger Video Capture
-- **Best-Effort Lookback**: Native Home Assistant lookback may reuse an already active HLS buffer, but cannot guarantee pre-trigger footage; cold streams may yield none. An external retained-video provider such as Frigate is optional, and no NVR is required.
+- **Best-Effort Lookback**: Native Home Assistant lookback may reuse an already active HLS buffer, but cannot guarantee pre-trigger footage; cold streams may yield none. go2rtc pre-roll comes from a bounded in-memory HLS fragment ring. It warms after startup or reconnect, can be short after outages, and repeated capture chunks may have gaps; absolute visual UTC remains unknown without a calibrated source clock.
+- **go2rtc Coverage**: go2rtc captures begin after the consumer attaches and wait for a video keyframe. Bounded MP4 duration is a wall-clock timeout, not proof of media coverage. `extend` requests repeated bounded chunks, which may have gaps at startup or handoff. Probed duration and partial state are used to report material shortfalls; exact visual timestamps remain unknown.
 
 ## 3. Chunk Handoff Coverage & Timing Metadata
 - **Best-Effort Segments & Source Media Bounds**: Native chunk handoff coverage depends on Home Assistant and stream keyframe timing. Coverage is best effort and has not been measured as gapless. Recording duration reflects actual received stream segment duration, with no wall-clock-duration promise beyond source media.

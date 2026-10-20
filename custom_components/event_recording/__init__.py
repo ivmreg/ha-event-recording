@@ -238,6 +238,8 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
     # Entry options are read dynamically by retention properties and profile lookup.
     coordinator.entry = entry
+    coordinator.go2rtc_buffers.entry = entry
+    await coordinator.go2rtc_buffers.reconcile()
     configure_integration_logging(
         bool(
             entry.options.get(

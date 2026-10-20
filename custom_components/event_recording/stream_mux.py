@@ -135,11 +135,20 @@ class StreamMuxWriter:
         target_path: Path | str,
         min_segment_duration: float = 0.0,
         orientation: int = 1,
+        *,
+        video_only: bool = False,
+        keyframe_start: bool = False,
+        max_bytes: int | None = None,
     ) -> None:
         self.target_path = Path(target_path).resolve()
         self.tmp_path = Path(str(self.target_path) + ".tmp")
         self.min_segment_duration = min_segment_duration
         self.orientation = orientation
+        self.video_only = video_only
+        self.keyframe_start = keyframe_start
+        self.max_bytes = max_bytes
+        self._input_packet_bytes = 0
+        self._keyframe_seen = False
         self.normalizer = MonotonicDtsNormalizer()
 
         self._output_container: Any = None
@@ -169,7 +178,13 @@ class StreamMuxWriter:
             orientation,
         )
 
-    def write_segment(self, segment: SegmentSnapshot) -> None:
+    def write_segment(
+        self,
+        segment: SegmentSnapshot,
+        *,
+        packet_start_index: int | None = None,
+        packet_end_index: int | None = None,
+    ) -> None:
         """Demux and remux a segment snapshot into the output container."""
         if self._closed:
             raise StreamMuxError("Cannot write to closed StreamMuxWriter")
@@ -221,7 +236,7 @@ class StreamMuxWriter:
                 self._video_time_base = Fraction(source_v.time_base)
 
                 # Add audio stream before header/start_encoding
-                if source_a:
+                if source_a and not self.video_only:
                     self._output_a = self._output_container.add_stream_from_template(source_a)
                     self._audio_codec = source_a.name
                     self._audio_rate = getattr(source_a, "sample_rate", None) or getattr(
@@ -251,12 +266,12 @@ class StreamMuxWriter:
                         f"got {Fraction(source_v.time_base)}"
                     )
 
-                if bool(source_a) != bool(self._output_a):
+                if not self.video_only and bool(source_a) != bool(self._output_a):
                     raise IncompatibleStreamError(
                         f"Audio stream presence changed across segments: "
                         f"expected {bool(self._output_a)}, got {bool(source_a)}"
                     )
-                if source_a:
+                if source_a and not self.video_only:
                     if source_a.name != self._audio_codec:
                         raise IncompatibleStreamError(
                             f"Audio codec changed across segments: "
@@ -305,12 +320,28 @@ class StreamMuxWriter:
             out_a_tb = Fraction(self._output_a.time_base) if self._output_a else None
 
             # Remux packets with monotonic DTS correction and explicit output time base
+            packet_index = 0
             for packet in source.demux():
                 stype = packet.stream.type
                 if stype == "video":
+                    if packet_start_index is not None:
+                        if packet.size <= 0 or packet.pts is None or packet.dts is None:
+                            continue
+                        current_index = packet_index
+                        packet_index += 1
+                        if current_index < packet_start_index:
+                            continue
+                        if packet_end_index is not None and current_index >= packet_end_index:
+                            break
+                    if self.keyframe_start and not self._keyframe_seen:
+                        if not packet.is_keyframe:
+                            continue
+                        self._keyframe_seen = True
                     out_stream = self._output_v
                     out_tb = out_v_tb
                 elif stype == "audio":
+                    if self.video_only:
+                        continue
                     if not self._output_a:
                         raise IncompatibleStreamError(
                             "Encountered audio packet but recording has no audio stream"
@@ -325,6 +356,11 @@ class StreamMuxWriter:
                 # Skip only empty flush packets at EOF
                 if packet_size == 0 and packet.pts is None and packet.dts is None:
                     continue
+
+                if self.max_bytes is not None:
+                    self._input_packet_bytes += max(0, int(packet_size))
+                    if self._input_packet_bytes > max(0, int(self.max_bytes) - 65536):
+                        raise StreamMuxError("CAPTURE_SIZE_LIMIT")
 
                 # Meaningful non-empty packet with missing timestamps fails explicitly
                 if packet.pts is None or packet.dts is None:
@@ -377,8 +413,13 @@ class StreamMuxWriter:
 
         try:
             if self._output_container:
+                video_track_count = len(self._output_container.streams.video)
+                audio_track_count = len(self._output_container.streams.audio)
                 self._output_container.close()
                 self._output_container = None
+            else:
+                video_track_count = 0
+                audio_track_count = 0
 
             if self._packets_written == 0 or not self.tmp_path.is_file() or self.tmp_path.stat().st_size == 0:
                 self.close()
@@ -390,6 +431,9 @@ class StreamMuxWriter:
             self._apply_orientation_and_rename()
 
             size = self.target_path.stat().st_size if self.target_path.is_file() else 0
+            if self.max_bytes is not None and size > self.max_bytes:
+                self.target_path.unlink(missing_ok=True)
+                raise StreamMuxError("CAPTURE_SIZE_LIMIT")
             _LOGGER.debug(
                 "StreamMuxWriter finished for %s: packets=%d, size_bytes=%d",
                 self.target_path.name,
@@ -401,6 +445,8 @@ class StreamMuxWriter:
                 "packets_written": self._packets_written,
                 "target_path": str(self.target_path),
                 "size_bytes": size,
+                "video_track_count": video_track_count,
+                "audio_track_count": audio_track_count,
             }
         finally:
             self.close()

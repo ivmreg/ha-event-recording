@@ -16,7 +16,12 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import entity_registry, selector
 
-from .camera_profiles import CAMERA_PROFILES, default_camera_profile, validate_camera_profile
+from .camera_profiles import (
+    CAMERA_PROFILES,
+    default_camera_profile,
+    validate_camera_profile,
+    validate_go2rtc_base_url,
+)
 from .const import (
     CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
     CONF_CHUNK_SECONDS,
@@ -26,6 +31,10 @@ from .const import (
     CONF_FRIGATE_AUTH_TOKEN,
     CONF_FRIGATE_BASE_URL,
     CONF_FRIGATE_CAMERA_NAME,
+    CONF_GO2RTC_BASE_URL,
+    CONF_GO2RTC_PASSWORD,
+    CONF_GO2RTC_STREAM,
+    CONF_GO2RTC_USERNAME,
     CONF_MAX_INCIDENT_SPAN_SECONDS,
     CONF_MAX_PARALLEL_RESOURCES,
     CONF_MAX_QUEUE_DEPTH,
@@ -33,6 +42,7 @@ from .const import (
     CONF_MEDIA_ROOT,
     CONF_MIN_DISK_FREE_MB,
     CONF_QUEUE_WAIT_TIMEOUT_SECONDS,
+    CONF_RECORDING_PROVIDER,
     CONF_RETENTION_DAYS,
     CONF_RETENTION_SIZE_MB,
     DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
@@ -55,6 +65,8 @@ from .const import (
     MODE_EXTEND,
     MODE_NATIVE_FIXED,
     MODE_NATIVE_SNAPSHOT,
+    PROVIDER_GO2RTC,
+    PROVIDER_HOME_ASSISTANT,
 )
 from .core.validation import (
     SPEC_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
@@ -190,8 +202,58 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         """Show the options menu."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["recording_settings", "storage_settings", "cameras", "effective_config"],
+            menu_options=["recording_settings", "storage_settings", "go2rtc_settings", "cameras", "effective_config"],
         )
+
+    async def async_step_go2rtc_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Configure the shared go2rtc connection without probing it."""
+        errors: dict[str, str] = {}
+        entry = self.config_entry
+        if user_input is not None:
+            raw_url = str(user_input.get(CONF_GO2RTC_BASE_URL, "")).strip()
+            username = str(user_input.get(CONF_GO2RTC_USERNAME, "")).strip()
+            password_value = user_input.get(CONF_GO2RTC_PASSWORD, "")
+            password = password_value if isinstance(password_value, str) else ""
+            clear_password = bool(user_input.pop("clear_go2rtc_password", False))
+            effective_password = None if clear_password else (
+                password or entry.options.get(CONF_GO2RTC_PASSWORD)
+            )
+            if raw_url:
+                try:
+                    user_input[CONF_GO2RTC_BASE_URL] = validate_go2rtc_base_url(raw_url)
+                except ValueError:
+                    errors[CONF_GO2RTC_BASE_URL] = "invalid_go2rtc_base_url"
+            else:
+                user_input[CONF_GO2RTC_BASE_URL] = None
+            if bool(username) != bool(effective_password):
+                errors[CONF_GO2RTC_USERNAME] = "go2rtc_credentials_incomplete"
+            user_input[CONF_GO2RTC_USERNAME] = username or None
+            if clear_password:
+                user_input[CONF_GO2RTC_PASSWORD] = None
+            elif password:
+                user_input[CONF_GO2RTC_PASSWORD] = password
+            else:
+                user_input[CONF_GO2RTC_PASSWORD] = effective_password
+            if not errors:
+                saved = self._current_options()
+                saved.update(user_input)
+                saved.pop("clear_go2rtc_password", None)
+                return self.async_create_entry(title="", data=saved)
+
+        options = entry.options
+        schema = vol.Schema(
+            {
+                vol.Optional(CONF_GO2RTC_BASE_URL, default=options.get(CONF_GO2RTC_BASE_URL) or ""): str,
+                vol.Optional(CONF_GO2RTC_USERNAME, default=options.get(CONF_GO2RTC_USERNAME) or ""): str,
+                vol.Optional(CONF_GO2RTC_PASSWORD, default=""): selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+                ),
+                vol.Optional("clear_go2rtc_password", default=False): bool,
+            }
+        )
+        return self.async_show_form(step_id="go2rtc_settings", data_schema=schema, errors=errors)
 
     async def async_step_recording_settings(
         self, user_input: dict[str, Any] | None = None
@@ -705,6 +767,10 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
             {"value": MODE_NATIVE_SNAPSHOT, "label": "Native Snapshot"},
             {"value": MODE_BUFFERED, "label": "Buffered Provider Export (Frigate NVR)"},
         ]
+        provider_choices = [
+            {"value": PROVIDER_HOME_ASSISTANT, "label": "Home Assistant camera stream"},
+            {"value": PROVIDER_GO2RTC, "label": "go2rtc MP4 stream"},
+        ]
         schema.update(
             {
                 vol.Required("source_id", default=profile.get("source_id", "camera")): str,
@@ -714,6 +780,14 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 ): selector.SelectSelector(
                     selector.SelectSelectorConfig(
                         options=mode_choices, mode=selector.SelectSelectorMode.DROPDOWN
+                    )
+                ),
+                vol.Required(
+                    CONF_RECORDING_PROVIDER,
+                    default=profile.get(CONF_RECORDING_PROVIDER, PROVIDER_HOME_ASSISTANT),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=provider_choices, mode=selector.SelectSelectorMode.DROPDOWN
                     )
                 ),
                 vol.Optional(
@@ -731,6 +805,9 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 vol.Required(
                     "max_window_seconds", default=profile.get("max_window_seconds", 300)
                 ): number_spec_selector(SPEC_MAX_WINDOW_SECONDS),
+                vol.Optional(
+                    CONF_GO2RTC_STREAM, default=profile.get(CONF_GO2RTC_STREAM) or ""
+                ): str,
                 vol.Optional(
                     CONF_FRIGATE_BASE_URL, default=profile.get(CONF_FRIGATE_BASE_URL) or ""
                 ): str,
@@ -805,6 +882,8 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                 "lookback_seconds",
                 "chunk_seconds",
                 "max_window_seconds",
+                CONF_RECORDING_PROVIDER,
+                CONF_GO2RTC_STREAM,
             )
         }
         raw_group = user_input.get("ownership_group", defaults.get("ownership_group"))
@@ -857,6 +936,8 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
             export_delay if export_delay is not None else DEFAULT_EXPORT_DELAY_SECONDS
         )
 
+        raw_stream = user_input.get(CONF_GO2RTC_STREAM, defaults.get(CONF_GO2RTC_STREAM))
+        profile[CONF_GO2RTC_STREAM] = raw_stream.strip() if isinstance(raw_stream, str) and raw_stream.strip() else None
         profile["hard_cap_behavior"] = "stop"
 
         raw_corr = user_input.get("correlation_group", defaults.get("correlation_group"))

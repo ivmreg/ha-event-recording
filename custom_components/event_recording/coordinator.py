@@ -40,6 +40,7 @@ from .const import (
 from .core.models import utc_now
 from .core.storage_ledger import StoragePolicy
 from .core.store import JournalStore
+from .go2rtc_buffer import Go2rtcBufferManager
 from .recorder import (
     CameraRecorderAdapter,
     FrigateBufferedAdapter,
@@ -258,7 +259,8 @@ class RecordingCoordinator:
         self._capacity_lock = asyncio.Lock()
 
         # Stream adapters
-        self.adapter = CameraRecorderAdapter(hass, registry)
+        self.go2rtc_buffers = Go2rtcBufferManager(hass, entry)
+        self.adapter = CameraRecorderAdapter(hass, registry, buffer_manager=self.go2rtc_buffers)
         self.snapshot_adapter = SnapshotRecorderAdapter(hass, registry)
 
         # Specialized session and capture execution delegates
@@ -397,6 +399,7 @@ class RecordingCoordinator:
         )
         if not self.registry.has_unsettled:
             await self.store.reconcile(worker_id=self.worker_id)
+        await self.go2rtc_buffers.reconcile()
         self._running = True
         self._worker_task = asyncio.create_task(self._worker_loop(), name="event_recording_worker")
 
@@ -422,6 +425,8 @@ class RecordingCoordinator:
                 *self._resource_tasks.values(), return_exceptions=True
             )
         self._resource_tasks.clear()
+
+        await self.go2rtc_buffers.stop()
 
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()

@@ -19,11 +19,15 @@ from .const import (
     CONF_CHUNK_SECONDS,
     CONF_ENABLE_AUTO_ASSOCIATION,
     CONF_ENABLE_DEBUG_LOGGING,
+    CONF_GO2RTC_BASE_URL,
+    CONF_GO2RTC_PASSWORD,
+    CONF_GO2RTC_USERNAME,
     CONF_MAX_INCIDENT_SPAN_SECONDS,
     CONF_MAX_PARALLEL_RESOURCES,
     CONF_MAX_QUEUE_DEPTH,
     CONF_MIN_DISK_FREE_MB,
     CONF_QUEUE_WAIT_TIMEOUT_SECONDS,
+    CONF_RECORDING_PROVIDER,
     CONF_RETENTION_DAYS,
     CONF_RETENTION_SIZE_MB,
     DATA_COORDINATOR,
@@ -91,6 +95,9 @@ async def async_get_config_entry_diagnostics(
         "effective_log_level": logging.getLevelName(
             logging.getLogger("custom_components.event_recording").getEffectiveLevel()
         ),
+        "go2rtc_configured": bool(options.get(CONF_GO2RTC_BASE_URL)),
+        "go2rtc_has_username": bool(options.get(CONF_GO2RTC_USERNAME)),
+        "go2rtc_has_password": bool(options.get(CONF_GO2RTC_PASSWORD)),
     }
 
     camera_map: dict[str, str] = {}
@@ -133,6 +140,8 @@ async def async_get_config_entry_diagnostics(
             "recording_mode": prof.get("recording_mode", "extend"),
             "ownership_group": _anonymize_group(prof.get("ownership_group")),
             "has_buffered_provider": bool(prof.get("frigate_base_url")),
+            CONF_RECORDING_PROVIDER: prof.get(CONF_RECORDING_PROVIDER, "home_assistant"),
+            "has_go2rtc_stream_alias": bool(prof.get("go2rtc_stream")),
             "window_seconds": prof.get("window_seconds"),
             "lookback_seconds": prof.get("lookback_seconds"),
             "chunk_seconds": prof.get("chunk_seconds"),
@@ -185,6 +194,15 @@ async def async_get_config_entry_diagnostics(
             "has_unsettled": registry.has_unsettled,
         }
 
+    buffer_info: dict[str, Any] = {}
+    if coordinator is not None:
+        buffer_manager = getattr(coordinator, "go2rtc_buffers", None)
+        if buffer_manager is not None:
+            try:
+                buffer_info = buffer_manager.diagnostics()
+            except Exception:
+                buffer_info = {"error": "unavailable"}
+
     storage_stats: dict[str, Any] = {}
     if store is not None:
         try:
@@ -216,6 +234,7 @@ async def async_get_config_entry_diagnostics(
         "slots": slots_info,
         "counters": counters_info,
         "registry": registry_info,
+        "go2rtc_video_buffers": buffer_info,
         "storage": storage_stats,
         "backup": backup_status,
     }

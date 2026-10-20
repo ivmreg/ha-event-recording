@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
 from collections.abc import Mapping
 from typing import Any
 
+from .const import (
+    MODE_BUFFERED,
+    MODE_EXTEND,
+    MODE_NATIVE_FIXED,
+    MODE_NATIVE_SNAPSHOT,
+    PROVIDER_GO2RTC,
+    PROVIDER_HOME_ASSISTANT,
+)
 from .core.validation import (
     SPEC_CHUNK_SECONDS,
     SPEC_EXPORT_DELAY_SECONDS,
@@ -44,6 +53,8 @@ def default_camera_profile(
         "chunk_seconds": chunk_seconds,
         "max_window_seconds": max_window_seconds,
         "recording_mode": "extend",
+        "recording_provider": PROVIDER_HOME_ASSISTANT,
+        "go2rtc_stream": None,
         "ownership_group": None,
         "hold": False,
         "tail_window_seconds": 0.0,
@@ -108,8 +119,19 @@ def validate_camera_profile(camera_entity: str, profile: Mapping[str, Any]) -> d
             errors[field] = f"invalid_{field}"
 
     recording_mode = profile.get("recording_mode", "extend")
-    if recording_mode not in ("extend", "native_fixed", "native_snapshot", "buffered"):
+    if recording_mode not in (MODE_EXTEND, MODE_NATIVE_FIXED, MODE_NATIVE_SNAPSHOT, MODE_BUFFERED):
         errors["recording_mode"] = "invalid_recording_mode"
+
+    provider = profile.get("recording_provider", PROVIDER_HOME_ASSISTANT)
+    if provider not in (PROVIDER_HOME_ASSISTANT, PROVIDER_GO2RTC):
+        errors["recording_provider"] = "invalid_recording_provider"
+    if provider == PROVIDER_GO2RTC:
+        if recording_mode not in (MODE_EXTEND, MODE_NATIVE_FIXED):
+            errors["recording_mode"] = "go2rtc_unsupported_recording_mode"
+        try:
+            validate_go2rtc_stream_alias(profile.get("go2rtc_stream"))
+        except ValueError:
+            errors["go2rtc_stream"] = "invalid_go2rtc_stream"
 
     if recording_mode == "buffered":
         base_url = profile.get("frigate_base_url")
@@ -169,3 +191,40 @@ def validate_camera_profile(camera_entity: str, profile: Mapping[str, Any]) -> d
                 errors[float_field] = f"invalid_{float_field}"
 
     return errors
+
+
+def validate_go2rtc_stream_alias(value: Any) -> str:
+    """Validate a named go2rtc stream alias, never an arbitrary source expression."""
+    if not isinstance(value, str):
+        raise ValueError("invalid go2rtc stream alias")
+    alias = value.strip()
+    if not alias or len(alias) > 128 or not re.fullmatch(r"[A-Za-z0-9_.-]+", alias):
+        raise ValueError("invalid go2rtc stream alias")
+    if "://" in alias or alias.startswith(("ffmpeg:", "rtsp:", "http:")):
+        raise ValueError("dynamic go2rtc sources are not allowed")
+    return alias
+
+
+def validate_go2rtc_base_url(value: Any) -> str:
+    """Validate an HTTP(S) go2rtc base URL with optional reverse-proxy path."""
+    if not isinstance(value, str):
+        raise ValueError("invalid go2rtc base URL")
+    url = value.strip().rstrip("/")
+    if not url or len(url) > 2048:
+        raise ValueError("invalid go2rtc base URL")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        _ = parsed.port  # Force invalid-port validation.
+    except ValueError as err:
+        raise ValueError("invalid go2rtc base URL") from err
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(ch.isspace() for ch in url)
+    ):
+        raise ValueError("invalid go2rtc base URL")
+    return url

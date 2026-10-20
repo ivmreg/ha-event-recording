@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_GO2RTC_STREAM,
+    CONF_RECORDING_PROVIDER,
     DEFAULT_EXPORT_DELAY_SECONDS,
     ERROR_BUFFER_UNAVAILABLE,
     ERROR_EXPIRED_WINDOW,
@@ -29,6 +31,8 @@ from .const import (
     MODE_EXTEND,
     MODE_NATIVE_FIXED,
     MODE_NATIVE_SNAPSHOT,
+    PROVIDER_GO2RTC,
+    PROVIDER_HOME_ASSISTANT,
     TIME_QUALITY_PROVIDER_REPORTED,
     TIME_QUALITY_UNKNOWN,
 )
@@ -136,9 +140,13 @@ class CaptureExecutor:
 
         profile_snapshot = dict(session_config.get("_event_recording_profile") or {})
         recording_mode = (
-            profile_snapshot.get("recording_mode")
-            or session_config.get("recording_mode")
+            session_config.get("recording_mode")
+            or profile_snapshot.get("recording_mode")
             or MODE_EXTEND
+        )
+        recording_provider = session_config.get(
+            CONF_RECORDING_PROVIDER,
+            profile_snapshot.get(CONF_RECORDING_PROVIDER, PROVIDER_HOME_ASSISTANT),
         )
         ownership_group = profile_snapshot.get("ownership_group") or session_config.get(
             "ownership_group"
@@ -309,9 +317,13 @@ class CaptureExecutor:
                 chunk_dur = min(chunk_seconds, max(1.0, remaining), max_remaining)
 
                 lookback = self.coordinator._lookbacks.get(event_id, 0.0) if is_first_chunk else 0.0
+                include_preroll = is_first_chunk
                 is_first_chunk = False
 
-                chunk_reservation = int(chunk_dur * ESTIMATED_BYTES_PER_SECOND)
+                reservation_seconds = chunk_dur + (
+                    lookback if recording_provider == PROVIDER_GO2RTC else 0.0
+                )
+                chunk_reservation = int(reservation_seconds * ESTIMATED_BYTES_PER_SECOND)
                 res_id = f"chunk_{event_id}_{uuid.uuid4().hex[:6]}"
                 staging_dir = self.store.media_root / ".staging"
                 staging_path = staging_dir / f"{event_id}_{uuid.uuid4().hex[:8]}.mp4"
@@ -350,14 +362,32 @@ class CaptureExecutor:
                     )
 
                     try:
-                        chunk_result = await self.adapter.record_chunk(
-                            camera_entity=resource_key,
-                            target_path=staging_path,
-                            duration_seconds=chunk_dur,
-                            lookback_seconds=lookback,
-                            ownership_group=ownership_group,
-                            lock_timeout_seconds=lock_timeout,
-                        )
+                        record_kwargs = {
+                            "camera_entity": resource_key,
+                            "target_path": staging_path,
+                            "duration_seconds": chunk_dur,
+                            "lookback_seconds": lookback,
+                            "ownership_group": ownership_group,
+                            "lock_timeout_seconds": lock_timeout,
+                        }
+                        if recording_provider == PROVIDER_GO2RTC:
+                            trigger_timestamp = (
+                                min(source.occurred_at for source in event.source_events).timestamp()
+                                if event.source_events
+                                else (event.start_at + timedelta(seconds=lookback)).timestamp()
+                            )
+                            record_kwargs.update(
+                                recording_provider=recording_provider,
+                                go2rtc_stream=session_config.get(
+                                    CONF_GO2RTC_STREAM,
+                                    profile_snapshot.get(CONF_GO2RTC_STREAM),
+                                ),
+                                max_bytes=chunk_reservation,
+                                event_id=event_id,
+                                include_preroll=include_preroll,
+                                event_start_timestamp=trigger_timestamp,
+                            )
+                        chunk_result = await self.adapter.record_chunk(**record_kwargs)
                         chunk_recorded = True
                         if isinstance(chunk_result, dict):
                             raw_partial = chunk_result.get("partial_error")
@@ -371,6 +401,8 @@ class CaptureExecutor:
                                         "STREAM_CAPTURE_TIMEOUT",
                                         "STREAM_SEQUENCE_GAP",
                                         "STREAM_PROVIDER_LOST",
+                                        "PREROLL_UNAVAILABLE",
+                                        "BUFFER_MEMORY_LIMIT",
                                     )
                                     else "STREAM_CAPTURE_FAILED"
                                 )
@@ -405,7 +437,7 @@ class CaptureExecutor:
                             last_error = ERROR_RESOURCE_QUARANTINED
                             break
                         try:
-                            await self.store.attach_and_promote_media(
+                            promoted_result = await self.store.attach_and_promote_media(
                                 event_id=event_id,
                                 src_path=staging_path,
                                 kind="video",
@@ -423,6 +455,22 @@ class CaptureExecutor:
                                 adopt_staging=True,
                             )
                             valid_clips_count += 1
+                            if recording_provider == PROVIDER_GO2RTC:
+                                promoted_media = promoted_result[1]
+                                self.coordinator.go2rtc_buffers.note_export(
+                                    str(record_kwargs.get("go2rtc_stream") or ""),
+                                    {
+                                        **(chunk_result or {}),
+                                        "probed_duration_seconds": promoted_media.duration,
+                                    },
+                                )
+                                duration_tolerance = max(0.25, chunk_dur * 0.1)
+                                if (
+                                    promoted_media.duration is not None
+                                    and promoted_media.duration < chunk_dur - duration_tolerance
+                                ):
+                                    partial_error = partial_error or "STREAM_CAPTURE_FAILED"
+                                    last_error = partial_error
                             _LOGGER.debug(
                                 "Promoted media chunk for %s (event_id=%s, size=%d bytes, valid_clips=%d)",
                                 resource_key,
@@ -478,6 +526,7 @@ class CaptureExecutor:
                 await self.store.update_capture_state(event_id, final_state, error_code="CANCELLED")
             raise
         finally:
+            self.coordinator.go2rtc_buffers.release_event(event_id)
             await self.slot_manager.release()
 
     async def _capture_snapshot(

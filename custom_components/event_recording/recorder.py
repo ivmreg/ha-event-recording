@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import re
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
 
     from homeassistant.core import HomeAssistant
 
-from .const import DEFAULT_WATCHDOG_PADDING_SECONDS
+from .const import DEFAULT_WATCHDOG_PADDING_SECONDS, PROVIDER_GO2RTC, PROVIDER_HOME_ASSISTANT
 from .core.models import sanitize_capture_error
 from .error_diagnostics import format_redacted_exception_traceback
 
@@ -463,10 +464,12 @@ class CameraRecorderAdapter:
         hass: HomeAssistant,
         registry: RecorderRegistry,
         timeout_padding_seconds: float = DEFAULT_WATCHDOG_PADDING_SECONDS,
+        buffer_manager: Any | None = None,
     ) -> None:
         self.hass = hass
         self.registry = registry
         self.padding = timeout_padding_seconds
+        self.buffer_manager = buffer_manager
 
     async def record_chunk(
         self,
@@ -476,6 +479,16 @@ class CameraRecorderAdapter:
         lookback_seconds: float = 0.0,
         ownership_group: str | None = None,
         lock_timeout_seconds: float = 15.0,
+        recording_provider: str = PROVIDER_HOME_ASSISTANT,
+        go2rtc_base_url: str | None = None,
+        go2rtc_username: str | None = None,
+        go2rtc_password: str | None = None,
+        go2rtc_stream: str | None = None,
+        go2rtc_include_audio: bool = True,
+        max_bytes: int = 20 * 1024 * 1024,
+        event_id: str | None = None,
+        include_preroll: bool = False,
+        event_start_timestamp: float | None = None,
     ) -> dict[str, Any] | None:
         """Capture one stream chunk and return settled backend metadata."""
         resolved_path = await self.hass.async_add_executor_job(Path(target_path).resolve)
@@ -501,22 +514,72 @@ class CameraRecorderAdapter:
         async with self.registry.acquire_locks(
             camera_entity, ownership_group, timeout_seconds=lock_timeout_seconds
         ):
-            from .stream_capture import async_record_stream
-
             loop = asyncio.get_running_loop()
             watchdog_deadline = loop.time() + duration_seconds + lookback_seconds + self.padding
+            if recording_provider == PROVIDER_GO2RTC:
+                if self.buffer_manager is not None:
+                    if not event_id:
+                        raise RecorderError("INVALID_EVENT_ID")
 
-            record_task = asyncio.create_task(
-                async_record_stream(
-                    hass=self.hass,
-                    camera_entity=camera_entity,
-                    target_path=resolved_path,
-                    duration_seconds=duration_seconds,
-                    lookback_seconds=lookback_seconds,
-                    watchdog_padding_seconds=self.padding,
-                    watchdog_deadline=watchdog_deadline,
+                    async def _capture_from_buffer() -> dict[str, Any]:
+                        try:
+                            return await self.buffer_manager.capture_chunk(
+                                camera_entity=camera_entity,
+                                alias=go2rtc_stream or "",
+                                target_path=resolved_path,
+                                duration_seconds=duration_seconds,
+                                lookback_seconds=lookback_seconds,
+                                event_id=event_id,
+                                include_preroll=include_preroll,
+                                event_start_timestamp=event_start_timestamp or time.time(),
+                                max_bytes=max_bytes,
+                                timeout_seconds=max(
+                                    1.0,
+                                    duration_seconds + lookback_seconds + self.padding - 0.5,
+                                ),
+                            )
+                        except Exception as err:
+                            if isinstance(err, asyncio.CancelledError):
+                                raise
+                            raise RecorderError(
+                                getattr(err, "code", "STREAM_CAPTURE_FAILED")
+                            ) from None
+
+                    record_task = asyncio.create_task(_capture_from_buffer())
+                else:
+                    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+                    record_task = asyncio.create_task(
+                        Go2rtcMp4Adapter(
+                            base_url=go2rtc_base_url,
+                            username=go2rtc_username,
+                            password=go2rtc_password,
+                            session=async_get_clientsession(self.hass),
+                            max_bytes=max_bytes,
+                            timeout_seconds=max(1.0, duration_seconds + self.padding - 0.5),
+                        ).capture(
+                            target_path=resolved_path,
+                            stream_alias=go2rtc_stream,
+                            duration_seconds=duration_seconds,
+                            include_audio=False,
+                        )
+                    )
+            elif recording_provider == PROVIDER_HOME_ASSISTANT:
+                from .stream_capture import async_record_stream
+
+                record_task = asyncio.create_task(
+                    async_record_stream(
+                        hass=self.hass,
+                        camera_entity=camera_entity,
+                        target_path=resolved_path,
+                        duration_seconds=duration_seconds,
+                        lookback_seconds=lookback_seconds,
+                        watchdog_padding_seconds=self.padding,
+                        watchdog_deadline=watchdog_deadline,
+                    )
                 )
-            )
+            else:
+                raise RecorderError("UNSUPPORTED_RECORDING_PROVIDER")
 
             self.registry.register_active(camera_entity, record_task, ownership_group)
 
@@ -564,6 +627,235 @@ class CameraRecorderAdapter:
                 raise RecorderError(clean_err) from err
             finally:
                 self.registry.release_active(camera_entity, record_task, ownership_group)
+
+
+async def _settled_file_operation(
+    function: Any, *args: Any, **kwargs: Any
+) -> tuple[Any, asyncio.CancelledError | None]:
+    """Finish a blocking file operation even when its caller is cancelled repeatedly."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as err:
+            cancellation = err
+        except Exception:
+            break
+    try:
+        result = task.result()
+    except BaseException:
+        if cancellation is not None:
+            raise cancellation
+        raise
+    return result, cancellation
+
+
+async def _settled_async_operation(awaitable: Any) -> tuple[Any, asyncio.CancelledError | None]:
+    """Finish an owned async cleanup operation before propagating cancellation."""
+    task = asyncio.create_task(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as err:
+            cancellation = err
+        except Exception:
+            break
+    try:
+        result = task.result()
+    except BaseException:
+        if cancellation is not None:
+            return None, cancellation
+        raise
+    return result, cancellation
+
+
+class Go2rtcMp4Adapter:
+    """Download a bounded MP4 from a configured named go2rtc stream alias."""
+
+    def __init__(
+        self,
+        base_url: str | None,
+        username: str | None = None,
+        password: str | None = None,
+        *,
+        session: Any | None = None,
+        timeout_seconds: float = 30.0,
+        max_bytes: int = 20 * 1024 * 1024,
+    ) -> None:
+        from .camera_profiles import validate_go2rtc_base_url
+
+        try:
+            self.base_url = validate_go2rtc_base_url(base_url)
+        except ValueError:
+            raise RecorderError("GO2RTC_NOT_CONFIGURED") from None
+        self.username = username.strip() if username and username.strip() else None
+        self.password = password if password else None
+        if bool(self.username) != bool(self.password):
+            raise RecorderError("GO2RTC_CREDENTIALS_INCOMPLETE")
+        self._session = session
+        self.timeout = max(1.0, min(float(timeout_seconds), 330.0))
+        self.max_bytes = max(1, int(max_bytes))
+
+    async def capture(
+        self,
+        *,
+        target_path: Path | str,
+        stream_alias: str | None,
+        duration_seconds: float,
+        include_audio: bool = True,
+    ) -> dict[str, Any]:
+        """Stream MP4 bytes to staging; visual time provenance stays unknown."""
+        from .camera_profiles import validate_go2rtc_stream_alias
+
+        try:
+            alias = validate_go2rtc_stream_alias(stream_alias)
+        except ValueError:
+            raise RecorderError("INVALID_GO2RTC_STREAM") from None
+        if not math.isfinite(float(duration_seconds)) or duration_seconds <= 0:
+            raise RecorderError("INVALID_CAPTURE_DURATION")
+
+        import aiohttp
+
+        target = Path(target_path)
+        _unused, cancellation = await _settled_file_operation(
+            target.parent.mkdir, parents=True, exist_ok=True
+        )
+        if cancellation is not None:
+            raise cancellation
+        requested_seconds = max(1, math.ceil(float(duration_seconds)))
+        url = f"{self.base_url}/api/stream.mp4"
+        params: dict[str, str] = {
+            "src": alias,
+            "duration": str(requested_seconds),
+            # Video-only selection omits go2rtc's default audio track when audio
+            # is disabled. Do not add the `mp4` query, which restores defaults.
+            "video": "h264,h265",
+        }
+        # Audio is intentionally never requested by this provider.
+        headers: dict[str, str] = {}
+        if self.username:
+            encode_basic_auth = getattr(aiohttp, "encode_basic_auth", None)
+            if callable(encode_basic_auth):
+                headers["Authorization"] = encode_basic_auth(
+                    self.username, self.password or ""
+                )
+            else:  # aiohttp < 3.14, still supported by Home Assistant installations
+                headers["Authorization"] = aiohttp.BasicAuth(
+                    self.username, self.password or "", encoding="utf-8"
+                ).encode()
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=min(10.0, self.timeout),
+            sock_read=min(10.0, self.timeout),
+        )
+        session = self._session
+        close_session = session is None
+        if session is None:
+            session = aiohttp.ClientSession()
+
+        file_handle: Any | None = None
+        downloaded = 0
+        partial_error: str | None = None
+        pending_cancellation: asyncio.CancelledError | None = None
+        try:
+            try:
+                async with session.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=timeout,
+                ) as response:
+                    if 300 <= response.status < 400:
+                        raise RecorderError("REDIRECT_NOT_ALLOWED")
+                    if response.status != 200:
+                        raise RecorderError(f"GO2RTC_HTTP_{response.status}")
+                    file_handle, cancellation = await _settled_file_operation(open, target, "wb")
+                    if cancellation is not None:
+                        pending_cancellation = cancellation
+                        raise cancellation
+                    async for chunk in response.content.iter_chunked(65536):
+                        if not chunk:
+                            continue
+                        remaining = self.max_bytes - downloaded
+                        if len(chunk) > remaining:
+                            partial_error = "STREAM_CAPTURE_FAILED"
+                            chunk = chunk[:remaining]
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        _written, cancellation = await _settled_file_operation(
+                            file_handle.write, chunk
+                        )
+                        if cancellation is not None:
+                            pending_cancellation = cancellation
+                            raise cancellation
+                        if partial_error is not None:
+                            break
+                    if downloaded == 0:
+                        raise RecorderError("EMPTY_GO2RTC_OUTPUT")
+            except asyncio.CancelledError:
+                raise
+            except (TimeoutError, aiohttp.ClientError, OSError):
+                if downloaded == 0:
+                    raise RecorderError("STREAM_CAPTURE_FAILED") from None
+                partial_error = "STREAM_CAPTURE_TIMEOUT"
+            finally:
+                if file_handle is not None:
+                    _flushed, cancellation = await _settled_file_operation(file_handle.flush)
+                    if cancellation is not None:
+                        pending_cancellation = cancellation
+                        raise cancellation
+                    _closed, cancellation = await _settled_file_operation(file_handle.close)
+                    file_handle = None
+                    if cancellation is not None:
+                        pending_cancellation = cancellation
+                        raise cancellation
+
+            return {
+                "downloaded_bytes": downloaded,
+                "requested_duration": float(duration_seconds),
+                "time_quality": "unknown",
+                "clock_source": "unknown",
+                "partial_error": partial_error,
+            }
+        except RecorderError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Do not expose chained aiohttp exceptions, which may contain full URLs.
+            if downloaded:
+                return {
+                    "downloaded_bytes": downloaded,
+                    "requested_duration": float(duration_seconds),
+                    "time_quality": "unknown",
+                    "clock_source": "unknown",
+                    "partial_error": "STREAM_CAPTURE_FAILED",
+                }
+            raise RecorderError("STREAM_CAPTURE_FAILED") from None
+        finally:
+            if file_handle is not None:
+                try:
+                    _closed, cancellation = await _settled_file_operation(file_handle.close)
+                except Exception:
+                    cancellation = None
+                file_handle = None
+                if cancellation is not None:
+                    pending_cancellation = cancellation
+            if close_session:
+                try:
+                    _closed_session, cancellation = await _settled_async_operation(
+                        session.close()
+                    )
+                except Exception:
+                    cancellation = None
+                if cancellation is not None:
+                    pending_cancellation = cancellation
+            if pending_cancellation is not None:
+                raise pending_cancellation
 
 
 class SnapshotRecorderAdapter:

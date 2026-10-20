@@ -26,6 +26,16 @@ CONF_FRIGATE_CAMERA_NAME = "frigate_camera_name"
 CONF_FRIGATE_AUTH_TOKEN = "frigate_auth_token"
 CONF_EXPORT_DELAY_SECONDS = "export_delay_seconds"
 
+# Shared go2rtc connection settings are stored only in config-entry options.
+CONF_GO2RTC_BASE_URL = "go2rtc_base_url"
+CONF_GO2RTC_USERNAME = "go2rtc_username"
+CONF_GO2RTC_PASSWORD = "go2rtc_password"
+CONF_RECORDING_PROVIDER = "recording_provider"
+CONF_GO2RTC_STREAM = "go2rtc_stream"
+CONF_GO2RTC_INCLUDE_AUDIO = "go2rtc_include_audio"
+PROVIDER_HOME_ASSISTANT = "home_assistant"
+PROVIDER_GO2RTC = "go2rtc"
+
 # Auto-association configuration keys
 CONF_ENABLE_AUTO_ASSOCIATION = "enable_auto_association"
 CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS = "auto_association_tolerance_seconds"

@@ -15,17 +15,33 @@ from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, cal
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.helpers import config_validation as cv
 
-from .camera_profiles import get_camera_profiles
+from .camera_profiles import (
+    get_camera_profiles,
+    validate_go2rtc_base_url,
+    validate_go2rtc_stream_alias,
+)
 from .const import (
     CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
     CONF_ENABLE_AUTO_ASSOCIATION,
+    CONF_GO2RTC_BASE_URL,
+    CONF_GO2RTC_INCLUDE_AUDIO,
+    CONF_GO2RTC_PASSWORD,
+    CONF_GO2RTC_STREAM,
+    CONF_GO2RTC_USERNAME,
     CONF_MAX_INCIDENT_SPAN_SECONDS,
+    CONF_RECORDING_PROVIDER,
     DATA_COORDINATOR,
     DATA_STORE,
     DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
     DEFAULT_ENABLE_AUTO_ASSOCIATION,
     DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
     DOMAIN,
+    MODE_BUFFERED,
+    MODE_EXTEND,
+    MODE_NATIVE_FIXED,
+    MODE_NATIVE_SNAPSHOT,
+    PROVIDER_GO2RTC,
+    PROVIDER_HOME_ASSISTANT,
     SERVICE_ATTACH_MEDIA,
     SERVICE_FINALIZE,
     SERVICE_LOG_EVENT,
@@ -308,6 +324,13 @@ def async_register_services(hass: HomeAssistant) -> None:
             float(data["tail_window_seconds"]) if "tail_window_seconds" in data else None
         )
         explicit_recorder_config = dict(data.get("recorder_config") or {})
+        if any(
+            key in explicit_recorder_config
+            for key in (CONF_GO2RTC_BASE_URL, CONF_GO2RTC_USERNAME, CONF_GO2RTC_PASSWORD)
+        ):
+            raise HomeAssistantError(
+                "go2rtc connection settings must be configured in Event Recording options"
+            )
         # This key is reserved for the integration's durable per-session snapshot.
         explicit_recorder_config.pop("_event_recording_profile", None)
         recorder_config = dict(explicit_recorder_config)
@@ -390,6 +413,60 @@ def async_register_services(hass: HomeAssistant) -> None:
             )
         window_seconds = float(window_seconds)
         lookback_seconds = float(lookback_seconds if lookback_seconds is not None else 0.0)
+
+        if is_camera:
+            provider = recorder_config.get(
+                CONF_RECORDING_PROVIDER,
+                (profile_defaults or {}).get(CONF_RECORDING_PROVIDER, PROVIDER_HOME_ASSISTANT),
+            )
+            mode = recorder_config.get(
+                "recording_mode", (profile_defaults or {}).get("recording_mode", MODE_EXTEND)
+            )
+            recorder_config["recording_mode"] = mode
+            if provider not in (PROVIDER_HOME_ASSISTANT, PROVIDER_GO2RTC):
+                raise HomeAssistantError("Unsupported camera recording provider")
+            recorder_config[CONF_RECORDING_PROVIDER] = provider
+            # A stop action must remain available if the shared go2rtc settings
+            # were removed after the recording started. Only capture-producing
+            # operations require a valid provider connection and alias.
+            if provider == PROVIDER_GO2RTC and operation != "stop":
+                if mode not in (MODE_EXTEND, MODE_NATIVE_FIXED):
+                    raise HomeAssistantError(
+                        "go2rtc supports only extend and native_fixed recording modes"
+                    )
+                options = getattr(getattr(coordinator, "entry", None), "options", {}) or {}
+                try:
+                    validate_go2rtc_base_url(options.get(CONF_GO2RTC_BASE_URL))
+                    alias = validate_go2rtc_stream_alias(
+                        recorder_config.get(
+                            CONF_GO2RTC_STREAM,
+                            (profile_defaults or {}).get(CONF_GO2RTC_STREAM),
+                        )
+                    )
+                except ValueError:
+                    raise HomeAssistantError(
+                        "go2rtc requires valid shared connection settings and a named stream alias"
+                    ) from None
+                # The shared go2rtc account can read every configured stream.
+                # A user authorized for this camera must not redirect the
+                # request to an alias owned by another camera.
+                if context.user_id is not None:
+                    user = await hass.auth.async_get_user(context.user_id)
+                    if user and not user.is_admin:
+                        profile_alias = (profile_defaults or {}).get(CONF_GO2RTC_STREAM)
+                        if not profile_alias or alias != profile_alias:
+                            raise Unauthorized(context=context)
+                # Discard the legacy option so no audio preference enters the
+                # durable event/session journal or changes provider behavior.
+                recorder_config.pop(CONF_GO2RTC_INCLUDE_AUDIO, None)
+                recorder_config[CONF_GO2RTC_STREAM] = alias
+            elif mode not in (
+                MODE_EXTEND,
+                MODE_NATIVE_FIXED,
+                MODE_NATIVE_SNAPSHOT,
+                MODE_BUFFERED,
+            ):
+                raise HomeAssistantError("Unsupported camera recording mode")
 
         access_entities = tuple(raw_access)
         if access_entities and context.user_id is not None:
