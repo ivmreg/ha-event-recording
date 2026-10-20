@@ -1,7 +1,7 @@
 """Database connection, pre-upgrade backups, and schema migrations for JournalStore.
 
 Strict boundary: Pure Python, zero Home Assistant imports, zero AI imports.
-Preserves SQLite v3 schema, pre-upgrade backup isolation, and WAL durability contracts.
+Preserves versioned SQLite schema, pre-upgrade backup isolation, and WAL durability contracts.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import format_iso, utc_now
-from .common import JournalStoreBase, _dict_factory
+from .common import SCHEMA_VERSION, JournalStoreBase, _dict_factory
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,9 +32,12 @@ class MigrationsMixin(JournalStoreBase):
         backup_dir = (self._db_path.parent / "event_recording_backups").resolve()
         backup_dir.mkdir(parents=True, exist_ok=True)
         temp_file = (
-            backup_dir / f"event_recording_v{from_version}_pre_v{to_version}_{uuid.uuid4().hex[:8]}.tmp.db"
+            backup_dir
+            / f"event_recording_v{from_version}_pre_v{to_version}_{uuid.uuid4().hex[:8]}.tmp.db"
         ).resolve()
-        final_file = (backup_dir / f"event_recording_v{from_version}_pre_v{to_version}.db").resolve()
+        final_file = (
+            backup_dir / f"event_recording_v{from_version}_pre_v{to_version}.db"
+        ).resolve()
 
         try:
             dest_conn = sqlite3.connect(str(temp_file))
@@ -170,8 +173,8 @@ class MigrationsMixin(JournalStoreBase):
 
         # Upgrade protection: before own SQLite schema mutation (open migrations)
         # create consistent SQLite.backup of PRE-UPGRADE database outside owned media retention tree.
-        if 0 < current_version < 3:
-            self._create_pre_upgrade_backup(current_version, 3)
+        if 0 < current_version < SCHEMA_VERSION:
+            self._create_pre_upgrade_backup(current_version, SCHEMA_VERSION)
 
         if current_version < 1:
             cur.execute("BEGIN IMMEDIATE;")
@@ -451,6 +454,34 @@ class MigrationsMixin(JournalStoreBase):
                 cur.execute(
                     "INSERT INTO schema_info (version, applied_at) VALUES (?, ?);",
                     (3, format_iso(utc_now()) or ""),
+                )
+                cur.execute("COMMIT;")
+            except Exception:
+                cur.execute("ROLLBACK;")
+                raise
+
+        if current_version < 4:
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                # Durable deletion claims keep unavailable files charged until unlink
+                # completes. No FK: a concurrent event deletion must not lose the claim.
+                cur.execute("""CREATE TABLE media_deletions (
+                    media_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );""")
+                cur.execute("CREATE INDEX idx_media_deletions_event ON media_deletions(event_id);")
+                cur.execute("CREATE INDEX idx_media_retention ON media(available, created_at);")
+                cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recording_intents';"
+                )
+                if cur.fetchone():
+                    cur.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_intents_event ON recording_intents(event_id, created_at);"
+                    )
+                cur.execute(
+                    "INSERT INTO schema_info(version, applied_at) VALUES (4, ?);",
+                    (format_iso(self.now()),),
                 )
                 cur.execute("COMMIT;")
             except Exception:

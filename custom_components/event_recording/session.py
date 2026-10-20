@@ -7,6 +7,7 @@ and session deadline evaluation.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -15,16 +16,6 @@ from .core.models import ResourceSession, utc_now
 from .core.store import JournalStore
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _safe_utc_now() -> Any:
-    """Return UTC now, respecting dynamic module monkeypatching on coordinator."""
-    import sys
-
-    coord_mod = sys.modules.get("custom_components.event_recording.coordinator")
-    if coord_mod is not None and hasattr(coord_mod, "utc_now"):
-        return coord_mod.utc_now()
-    return utc_now()
 
 
 def prepare_profile_session_intent(
@@ -73,8 +64,9 @@ def prepare_profile_session_intent(
 class SessionCoordinator:
     """Coordinates recording intent admission, session profiles, and deadline checks."""
 
-    def __init__(self, store: JournalStore) -> None:
+    def __init__(self, store: JournalStore, clock: Callable[[], datetime] = utc_now) -> None:
         self.store = store
+        self._clock = clock
 
     async def admit_record_intent(self, *args: Any, **kwargs: Any) -> Any:
         """Pin camera-profile defaults to a new session before durable admission."""
@@ -115,7 +107,7 @@ class SessionCoordinator:
 
         Returns (is_expired, deadline_seconds, scene_deadline).
         """
-        now = _safe_utc_now()
+        now = self._clock()
         deadline_seconds = float(queue_wait_timeout_seconds)
         if recording_mode != MODE_BUFFERED and not session.hold:
             remaining_scene = (session.desired_capture_end - now).total_seconds()

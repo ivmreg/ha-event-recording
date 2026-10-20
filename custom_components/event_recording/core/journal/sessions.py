@@ -117,7 +117,10 @@ class SessionsMixin(JournalStoreBase):
                     if existing["access_entities_json"]
                     else ()
                 )
-                if caller_entities != existing_entities or owner_user_id != existing["owner_user_id"]:
+                if (
+                    caller_entities != existing_entities
+                    or owner_user_id != existing["owner_user_id"]
+                ):
                     raise PermissionError("Access denied")
 
                 cur.execute("SELECT * FROM events WHERE event_id = ?;", (existing["event_id"],))
@@ -241,7 +244,9 @@ class SessionsMixin(JournalStoreBase):
         validate_finite_number(window_seconds, "window_seconds", min_val=0.0, allow_zero=False)
         validate_bounded_string(idempotency_key, "idempotency_key")
         validate_finite_number(lookback_seconds, "lookback_seconds", min_val=0.0, allow_zero=True)
-        validate_finite_number(tail_window_seconds, "tail_window_seconds", min_val=0.0, allow_zero=True)
+        validate_finite_number(
+            tail_window_seconds, "tail_window_seconds", min_val=0.0, allow_zero=True
+        )
         validate_payload_json(recorder_config, "recorder_config")
         validate_bounded_string(label, "label", max_len=500, allow_none=True)
         validate_payload_json(payload, "payload")
@@ -324,7 +329,10 @@ class SessionsMixin(JournalStoreBase):
                     if existing_source["access_entities_json"]
                     else ()
                 )
-                if caller_entities != existing_entities or owner_user_id != existing_source["owner_user_id"]:
+                if (
+                    caller_entities != existing_entities
+                    or owner_user_id != existing_source["owner_user_id"]
+                ):
                     raise PermissionError("Access denied")
 
                 cur.execute(
@@ -351,7 +359,10 @@ class SessionsMixin(JournalStoreBase):
                         (session["active_event_id"],),
                     )
                     active_ev_row = cur.fetchone()
-                    if active_ev_row and active_ev_row["capture_state"] in ("requested", "recording"):
+                    if active_ev_row and active_ev_row["capture_state"] in (
+                        "requested",
+                        "recording",
+                    ):
                         active_event_id = session["active_event_id"]
                         active_ev = active_ev_row
 
@@ -366,7 +377,10 @@ class SessionsMixin(JournalStoreBase):
                         else ()
                     )
                     caller_access = tuple(sorted(set(access_entities))) if access_entities else ()
-                    if caller_access != active_access or owner_user_id != active_ev["owner_user_id"]:
+                    if (
+                        caller_access != active_access
+                        or owner_user_id != active_ev["owner_user_id"]
+                    ):
                         raise PermissionError("Access denied")
 
                     session_cfg = (
@@ -413,7 +427,14 @@ class SessionsMixin(JournalStoreBase):
                             tail_window_seconds = ?, updated_at = ?
                         WHERE resource_key = ?;
                         """,
-                        (desired_str, dt_str, session_hold, tail_window_seconds, now_str, resource_key),
+                        (
+                            desired_str,
+                            dt_str,
+                            session_hold,
+                            tail_window_seconds,
+                            now_str,
+                            resource_key,
+                        ),
                     )
 
                     # Persist source event for coalesced intent
@@ -687,6 +708,41 @@ class SessionsMixin(JournalStoreBase):
                 for r in rows
             ]
 
+    async def get_capture_lookback(self, event_id: str) -> float:
+        """Read the initial request's durable lookback without per-event RAM state."""
+
+        def read() -> float:
+            with self._lock:
+                assert self._conn is not None
+                row = self._conn.execute(
+                    """SELECT lookback_seconds FROM recording_intents
+                    WHERE event_id = ? AND operation != 'stop'
+                    ORDER BY created_at, intent_id LIMIT 1;""",
+                    (event_id,),
+                ).fetchone()
+                return float(row["lookback_seconds"]) if row else 0.0
+
+        return await asyncio.to_thread(read)
+
+    async def compact_recording_intents(self, max_age_days: int = 7, limit: int = 500) -> int:
+        """Discard terminal dispatcher bookkeeping; source-journal deduplication remains."""
+
+        def compact() -> int:
+            cutoff = format_iso(utc_now() - timedelta(days=max_age_days))
+            with self._lock:
+                assert self._conn is not None
+                cur = self._conn.execute(
+                    """DELETE FROM recording_intents WHERE intent_id IN (
+                    SELECT intent_id FROM recording_intents
+                    WHERE status IN ('completed', 'failed', 'cancelled') AND updated_at < ?
+                    ORDER BY updated_at LIMIT ?
+                );""",
+                    (cutoff, limit),
+                )
+                return cur.rowcount
+
+        return await asyncio.to_thread(compact)
+
     async def complete_record_intent(
         self,
         intent_id: str,
@@ -735,9 +791,7 @@ class SessionsMixin(JournalStoreBase):
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute(
-                "SELECT * FROM resource_sessions WHERE resource_key = ?;", (resource_key,)
-            )
+            cur.execute("SELECT * FROM resource_sessions WHERE resource_key = ?;", (resource_key,))
             row = cur.fetchone()
             if not row:
                 return None

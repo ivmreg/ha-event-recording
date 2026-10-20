@@ -15,7 +15,8 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 from .const import DATA_API, DOMAIN
-from .core.models import Incident, IncidentInputs, MediaItem, RecordedEvent
+from .core.journal.common import DEFAULT_PIN_LEASE_SECONDS
+from .core.models import Incident, IncidentInputs, MediaPinLease, RecordedEvent
 from .core.store import JournalStore
 
 
@@ -48,6 +49,87 @@ class RecordingAPI:
         """Return the underlying JournalStore for pure core reads, writes, and CAS annotations."""
         return self._store
 
+    @property
+    def is_open(self) -> bool:
+        return self._store.is_open
+
+    async def list_finalized_media(
+        self, cursor: str | None = None, limit: int = 50, namespace_lacking: str | None = None
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        return await self._store.list_finalized_media(
+            cursor=cursor, limit=limit, namespace_lacking=namespace_lacking
+        )
+
+    async def reserve_annotation(
+        self,
+        event_id: str,
+        namespace: str,
+        expected_media_revision: int,
+        worker_id: str,
+        ttl_seconds: float = 180.0,
+    ) -> int | None:
+        return await self._store.reserve_annotation(
+            event_id=event_id,
+            namespace=namespace,
+            expected_media_revision=expected_media_revision,
+            worker_id=worker_id,
+            ttl_seconds=ttl_seconds,
+        )
+
+    async def renew_annotation_reservation(
+        self,
+        event_id: str,
+        namespace: str,
+        expected_media_revision: int,
+        expected_generation: int,
+        worker_id: str,
+        ttl_seconds: float = 180.0,
+    ) -> bool:
+        return await self._store.renew_annotation_reservation(
+            event_id=event_id,
+            namespace=namespace,
+            expected_media_revision=expected_media_revision,
+            expected_generation=expected_generation,
+            worker_id=worker_id,
+            ttl_seconds=ttl_seconds,
+        )
+
+    async def set_annotation_cas(
+        self,
+        event_id: str,
+        expected_media_revision: int,
+        namespace: str,
+        payload: dict[str, Any],
+        expected_generation: int | None = None,
+        status: str | None = None,
+    ) -> bool:
+        return await self._store.set_annotation_cas(
+            event_id=event_id,
+            expected_media_revision=expected_media_revision,
+            namespace=namespace,
+            payload=payload,
+            expected_generation=expected_generation,
+            status=status,
+        )
+
+    async def pin_media_lease(
+        self,
+        event_id: str,
+        lease_seconds: float = DEFAULT_PIN_LEASE_SECONDS,
+        reason: str | None = None,
+    ) -> MediaPinLease | None:
+        return await self._store.pin_media_lease(
+            event_id=event_id, lease_seconds=lease_seconds, reason=reason
+        )
+
+    async def release_media_pin(self, lease_token: str) -> bool:
+        return await self._store.release_media_pin(lease_token)
+
+    async def list_incidents(
+        self, limit: int = 50, before_cursor: str | None = None
+    ) -> tuple[list[Incident], str | None]:
+        return await self._store.list_incidents(limit=limit, before_cursor=before_cursor)
+
     async def get_event(self, event_id: str) -> RecordedEvent | None:
         """Async delegate to store.get_event."""
         return await self._store.get_event(event_id)
@@ -58,15 +140,7 @@ class RecordingAPI:
         Raises KeyError if event or media is missing, ValueError if unavailable,
         PermissionError if path traversal is detected, or FileNotFoundError if missing on disk.
         """
-        event = await self._store.get_event(event_id)
-        if not event:
-            raise KeyError(f"Event '{event_id}' not found")
-
-        matching: MediaItem | None = None
-        for item in event.media:
-            if item.id == media_id:
-                matching = item
-                break
+        matching = await self._store.get_media(media_id, event_id=event_id)
 
         if not matching:
             raise KeyError(f"Media '{media_id}' not associated with event '{event_id}'")

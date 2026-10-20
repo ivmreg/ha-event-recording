@@ -12,7 +12,7 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -36,7 +36,7 @@ from .const import (
     TIME_QUALITY_PROVIDER_REPORTED,
     TIME_QUALITY_UNKNOWN,
 )
-from .core.models import RecordedEvent, ResourceSession, sanitize_capture_error, utc_now
+from .core.models import RecordedEvent, ResourceSession, sanitize_capture_error
 from .core.storage_ledger import StorageCapacityError
 from .core.store import JournalStore
 from .recorder import (
@@ -54,30 +54,33 @@ _LOGGER = logging.getLogger(__name__)
 ESTIMATED_BYTES_PER_SECOND = 1024 * 1024
 
 
-def _safe_utc_now() -> Any:
-    """Return UTC now, respecting dynamic module monkeypatching on coordinator."""
-    import sys
+class CaptureContext(Protocol):
+    """The capture engine's explicit runtime dependencies; no private field access."""
 
-    coord_mod = sys.modules.get("custom_components.event_recording.coordinator")
-    if coord_mod is not None and hasattr(coord_mod, "utc_now"):
-        return coord_mod.utc_now()
-    return utc_now()
+    hass: HomeAssistant
+    store: JournalStore
+    registry: RecorderRegistry
+    adapter: CameraRecorderAdapter
+    snapshot_adapter: SnapshotRecorderAdapter
+    slot_manager: Any
+    session_coordinator: Any
+    go2rtc_buffers: Any
+    admission_lock: asyncio.Lock
+    running: bool
+    queue_wait_timeout_seconds: float
+    max_window_seconds: int
+    chunk_seconds: int
+    expired_captures_count: int
+    queue_timeouts_count: int
+    queue_overflow_count: int
 
-
-def _get_frigate_buffered_adapter() -> Any:
-    """Return FrigateBufferedAdapter class, respecting dynamic module patching on coordinator."""
-    import sys
-
-    coord_mod = sys.modules.get("custom_components.event_recording.coordinator")
-    if coord_mod is not None and hasattr(coord_mod, "FrigateBufferedAdapter"):
-        return coord_mod.FrigateBufferedAdapter
-    return FrigateBufferedAdapter
+    def now(self) -> datetime: ...
 
 
 class CaptureExecutor:
     """Coordinates capture task execution, slot semaphore acquisition, and adapter dispatch."""
 
-    def __init__(self, coordinator: Any) -> None:
+    def __init__(self, coordinator: CaptureContext) -> None:
         self.coordinator = coordinator
 
     @property
@@ -102,7 +105,7 @@ class CaptureExecutor:
 
     @property
     def slot_manager(self) -> Any:
-        return self.coordinator._slot_manager
+        return self.coordinator.slot_manager
 
     async def finish_capture(
         self, event_id: str, valid_clips_count: int, error: str | None
@@ -187,7 +190,7 @@ class CaptureExecutor:
             return
 
         if not acquired:
-            now_post = _safe_utc_now()
+            now_post = self.coordinator.now()
             if (
                 recording_mode != MODE_BUFFERED
                 and not session.hold
@@ -221,7 +224,7 @@ class CaptureExecutor:
                 return
             valid_clips_count = sum(1 for media in event.media if media.available)
 
-            now = _safe_utc_now()
+            now = self.coordinator.now()
             if (
                 recording_mode != MODE_BUFFERED
                 and not session.hold
@@ -290,13 +293,13 @@ class CaptureExecutor:
             )
             is_fixed = recording_mode == MODE_NATIVE_FIXED
 
-            while self.coordinator._running:
+            while self.coordinator.running:
                 # Revalidate scene state with fresh session
                 fresh_s = await self.store.get_resource_session(resource_key)
                 if not fresh_s or fresh_s.active_event_id != event_id:
                     break
                 session = fresh_s
-                now = _safe_utc_now()
+                now = self.coordinator.now()
                 if not session.hold and now >= session.desired_capture_end:
                     break
 
@@ -316,7 +319,9 @@ class CaptureExecutor:
                 )
                 chunk_dur = min(chunk_seconds, max(1.0, remaining), max_remaining)
 
-                lookback = self.coordinator._lookbacks.get(event_id, 0.0) if is_first_chunk else 0.0
+                lookback = (
+                    await self.store.get_capture_lookback(event_id) if is_first_chunk else 0.0
+                )
                 include_preroll = is_first_chunk
                 is_first_chunk = False
 
@@ -372,7 +377,9 @@ class CaptureExecutor:
                         }
                         if recording_provider == PROVIDER_GO2RTC:
                             trigger_timestamp = (
-                                min(source.occurred_at for source in event.source_events).timestamp()
+                                min(
+                                    source.occurred_at for source in event.source_events
+                                ).timestamp()
                                 if event.source_events
                                 else (event.start_at + timedelta(seconds=lookback)).timestamp()
                             )
@@ -549,7 +556,7 @@ class CaptureExecutor:
         try:
             await self.store.reserve_in_flight(res_id, staging_path, snap_reservation)
 
-            alias_timeout = max(0.1, (scene_deadline - _safe_utc_now()).total_seconds())
+            alias_timeout = max(0.1, (scene_deadline - self.coordinator.now()).total_seconds())
             snap_meta = await self.snapshot_adapter.capture_snapshot(
                 camera_entity=resource_key,
                 target_path=staging_path,
@@ -641,7 +648,7 @@ class CaptureExecutor:
             export_delay = float(
                 profile_snapshot.get("export_delay_seconds", DEFAULT_EXPORT_DELAY_SECONDS)
             )
-            now_ts = _safe_utc_now().timestamp()
+            now_ts = self.coordinator.now().timestamp()
             wait_sec = (end_ts + export_delay) - now_ts
             if wait_sec > 0:
                 await asyncio.sleep(min(wait_sec, float(max_window_seconds)))
@@ -659,7 +666,7 @@ class CaptureExecutor:
                 "frigate_auth_token"
             )
 
-            adapter_cls = _get_frigate_buffered_adapter()
+            adapter_cls = FrigateBufferedAdapter
             adapter = adapter_cls(
                 base_url=frigate_url,
                 auth_token=frigate_token,

@@ -21,6 +21,7 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -74,12 +75,13 @@ class JournalStore(
         media_root: str | Path,
         allowed_media_roots: Sequence[str | Path] | None = None,
         probe: MediaProbe | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
+        self._clock = clock
+        self._retention_lock = threading.Lock()
         self._db_path_raw = Path(db_path)
         self._media_root_raw = Path(media_root)
-        self._allowed_media_roots_raw = [
-            Path(p) for p in (allowed_media_roots or [])
-        ]
+        self._allowed_media_roots_raw = [Path(p) for p in (allowed_media_roots or [])]
         self._db_path = self._db_path_raw
         self._media_root = self._media_root_raw
         self._allowed_media_roots = [self._media_root, *self._allowed_media_roots_raw]
@@ -91,7 +93,9 @@ class JournalStore(
         self._incident_subscribers: set[Callable[[str, int], None]] = set()
         self._active_promotion_futures: set[asyncio.Future[Any]] = set()
         self.ledger = StorageLedger()
-        self._storage_policy: StoragePolicy = StoragePolicy(min_disk_free_mb=50, retention_size_mb=None)
+        self._storage_policy: StoragePolicy = StoragePolicy(
+            min_disk_free_mb=50, retention_size_mb=None
+        )
 
         # Backup metadata
         self._backup_in_progress = False
@@ -100,6 +104,10 @@ class JournalStore(
         self._last_backup_created_at = None
         self._last_backup_from_version = None
         self._last_backup_to_version = None
+
+    def now(self) -> datetime:
+        """Clock dependency shared by persistence, retention, and recovery."""
+        return self._clock() if self._clock else utc_now()
 
     @property
     def storage_policy(self) -> StoragePolicy:

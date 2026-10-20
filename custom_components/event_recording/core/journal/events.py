@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import sqlite3
-import sys
 from typing import Any
 
 from ..media import unlink_promoted_media
@@ -28,31 +27,58 @@ from .common import CommitEffects, JournalStoreBase
 _LOGGER = logging.getLogger(__name__)
 
 
-def _safe_unlink_promoted_media(media_root: Any, filename: str) -> bool:
-    """Unlink promoted media file, respecting module monkeypatching on core.store."""
-    store_mod = sys.modules.get("custom_components.event_recording.core.store")
-    if store_mod is not None and hasattr(store_mod, "unlink_promoted_media"):
-        return store_mod.unlink_promoted_media(media_root, filename)
-    return unlink_promoted_media(media_root, filename)
-
-
 class EventsMixin(JournalStoreBase):
     """Encapsulates event hydration, query pagination, activity, and deletion."""
 
     def _sync_hydrate_event(self, cur: sqlite3.Cursor, event_row: dict[str, Any]) -> RecordedEvent:
-        event_id = event_row["event_id"]
+        return self._sync_hydrate_events(cur, [event_row])[0]
 
-        # Hydrate source events
+    def _sync_hydrate_events(
+        self, cur: sqlite3.Cursor, rows: list[dict[str, Any]]
+    ) -> list[RecordedEvent]:
+        """Load each child table once per page, preserving the full event contract."""
+        if not rows:
+            return []
+        ids = [row["event_id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        children: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for table, order in (
+            ("source_journal", "id"),
+            ("media", "created_at"),
+            ("annotations", "namespace"),
+        ):
+            cur.execute(
+                f"SELECT * FROM {table} WHERE event_id IN ({placeholders}) ORDER BY {order};", ids
+            )
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for child in cur.fetchall():
+                grouped.setdefault(child["event_id"], []).append(child)
+            children[table] = grouped
         cur.execute(
-            """
-            SELECT id, source_id, kind, occurred_at, idempotency_key, label, payload_json, correlation_id, created_at
-            FROM source_journal
-            WHERE event_id = ?
-            ORDER BY id ASC;
-            """,
-            (event_id,),
+            f"SELECT DISTINCT event_id FROM media_pins WHERE event_id IN ({placeholders}) AND expires_at > ?;",
+            [*ids, format_iso(utc_now())],
         )
-        source_rows = cur.fetchall()
+        pinned = {row["event_id"] for row in cur.fetchall()}
+        return [
+            self._event_from_rows(
+                row,
+                children["source_journal"].get(row["event_id"], []),
+                children["media"].get(row["event_id"], []),
+                children["annotations"].get(row["event_id"], []),
+                row["event_id"] in pinned,
+            )
+            for row in rows
+        ]
+
+    @staticmethod
+    def _event_from_rows(
+        event_row: dict[str, Any],
+        source_rows: list[dict[str, Any]],
+        media_rows: list[dict[str, Any]],
+        annotation_rows: list[dict[str, Any]],
+        has_active_pins: bool,
+    ) -> RecordedEvent:
+        event_id = event_row["event_id"]
         source_records = tuple(
             SourceEventRecord(
                 id=r["id"],
@@ -68,28 +94,6 @@ class EventsMixin(JournalStoreBase):
             for r in source_rows
         )
 
-        # Hydrate media items
-        cur.execute(
-            """
-            SELECT id, kind, mime_type, file_name, duration, size_bytes, available, content_hash, created_at,
-                   requested_start, requested_end, capture_start, capture_end,
-                   time_quality, clock_source, time_uncertainty_seconds, start_offset_seconds
-            FROM media
-            WHERE event_id = ?
-            ORDER BY created_at ASC;
-            """,
-            (event_id,),
-        )
-        media_rows = cur.fetchall()
-
-        # Check if there are active pins
-        now_str = format_iso(utc_now()) or ""
-        cur.execute(
-            "SELECT 1 FROM media_pins WHERE event_id = ? AND expires_at > ? LIMIT 1;",
-            (event_id, now_str),
-        )
-        has_active_pins = cur.fetchone() is not None
-
         media_items = tuple(
             MediaItem(
                 id=m["id"],
@@ -102,7 +106,9 @@ class EventsMixin(JournalStoreBase):
                 is_pinned=has_active_pins,
                 content_hash=m["content_hash"],
                 created_at=ensure_utc(m["created_at"]),
-                requested_start=ensure_utc(m["requested_start"]) if m.get("requested_start") else None,
+                requested_start=ensure_utc(m["requested_start"])
+                if m.get("requested_start")
+                else None,
                 requested_end=ensure_utc(m["requested_end"]) if m.get("requested_end") else None,
                 capture_start=ensure_utc(m["capture_start"]) if m.get("capture_start") else None,
                 capture_end=ensure_utc(m["capture_end"]) if m.get("capture_end") else None,
@@ -114,16 +120,6 @@ class EventsMixin(JournalStoreBase):
             for m in media_rows
         )
 
-        # Hydrate annotations
-        cur.execute(
-            """
-            SELECT namespace, generation, expected_media_revision, payload_json, status, updated_at
-            FROM annotations
-            WHERE event_id = ?;
-            """,
-            (event_id,),
-        )
-        annotation_rows = cur.fetchall()
         annotations = {}
         for a in annotation_rows:
             raw_payload = json.loads(a["payload_json"]) if a["payload_json"] else {}
@@ -188,6 +184,28 @@ class EventsMixin(JournalStoreBase):
                 return None
             return self._sync_hydrate_event(cur, row)
 
+    async def get_event_access(self, event_id: str) -> Any:
+        """Read only authorization fields for revision subscriptions."""
+        from types import SimpleNamespace
+
+        def read() -> Any:
+            with self._lock:
+                assert self._conn is not None
+                row = self._conn.execute(
+                    "SELECT owner_user_id, access_entities_json FROM events WHERE event_id = ?;",
+                    (event_id,),
+                ).fetchone()
+                return (
+                    SimpleNamespace(
+                        owner_user_id=row["owner_user_id"],
+                        access_entities=tuple(json.loads(row["access_entities_json"] or "[]")),
+                    )
+                    if row
+                    else None
+                )
+
+        return await asyncio.to_thread(read)
+
     async def list_events(
         self,
         filters: dict[str, Any] | None = None,
@@ -231,7 +249,7 @@ class EventsMixin(JournalStoreBase):
             annotation_exclusion = filters.get("exclude_current_complete_annotation")
             if annotation_exclusion is not None:
                 namespace = annotation_exclusion["namespace"]
-                field_path = f'$.{annotation_exclusion["field"]}'
+                field_path = f"$.{annotation_exclusion['field']}"
                 encoded_value = json.dumps(annotation_exclusion["equals"], allow_nan=False)
                 clauses.append(
                     """
@@ -295,7 +313,7 @@ class EventsMixin(JournalStoreBase):
 
             has_more = len(rows) > limit
             result_rows = rows[:limit]
-            events = [self._sync_hydrate_event(cur, r) for r in result_rows]
+            events = self._sync_hydrate_events(cur, result_rows)
 
             next_cursor = None
             if has_more and result_rows:
@@ -485,7 +503,10 @@ class EventsMixin(JournalStoreBase):
             )
             inc_ids = [r["incident_id"] for r in cur.fetchall()]
 
-            cur.execute("SELECT file_name, size_bytes FROM media WHERE event_id = ?;", (event_id,))
+            cur.execute(
+                "SELECT file_name, size_bytes FROM media WHERE event_id = ? AND available = 1;",
+                (event_id,),
+            )
             media_files = [(r["file_name"], r["size_bytes"] or 0) for r in cur.fetchall()]
 
             cur.execute("BEGIN IMMEDIATE;")
@@ -506,7 +527,7 @@ class EventsMixin(JournalStoreBase):
             unlinked_count = 0
             for fn, sz in media_files:
                 try:
-                    if _safe_unlink_promoted_media(self._media_root, fn):
+                    if unlink_promoted_media(self._media_root, fn):
                         freed_bytes += sz
                         unlinked_count += 1
                 except Exception:

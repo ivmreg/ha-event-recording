@@ -19,7 +19,7 @@ from ..storage_ledger import StorageLedger, StoragePolicy
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_PIN_LEASE_SECONDS = 900.0
 DEFAULT_PIN_LEASE_SECONDS = 300.0
 
@@ -38,18 +38,6 @@ def _dict_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any
     """Convert SQLite row tuple to string-keyed dictionary."""
     fields = [col[0] for col in cursor.description]
     return dict(zip(fields, row, strict=False))
-
-
-def _safe_utc_now() -> Any:
-    """Return UTC now, respecting dynamic module monkeypatching on core.store."""
-    import sys
-
-    from ..models import utc_now
-
-    store_mod = sys.modules.get("custom_components.event_recording.core.store")
-    if store_mod is not None and hasattr(store_mod, "utc_now"):
-        return store_mod.utc_now()
-    return utc_now()
 
 
 class JournalStoreBase:

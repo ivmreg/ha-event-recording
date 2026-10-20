@@ -145,7 +145,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     media_dirs = getattr(hass.config, "media_dirs", {}) or {}
     for m_dir in media_dirs.values():
         try:
-                allowed_roots.append(Path(m_dir))
+            allowed_roots.append(Path(m_dir))
         except Exception:
             pass
     try:
@@ -236,10 +236,7 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await hass.config_entries.async_reload(entry.entry_id)
         return
 
-    # Entry options are read dynamically by retention properties and profile lookup.
-    coordinator.entry = entry
-    coordinator.go2rtc_buffers.entry = entry
-    await coordinator.go2rtc_buffers.reconcile()
+    await coordinator.apply_settings(entry)
     configure_integration_logging(
         bool(
             entry.options.get(
@@ -248,4 +245,3 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             )
         )
     )
-    await coordinator.set_max_parallel_resources(coordinator.max_parallel_resources)

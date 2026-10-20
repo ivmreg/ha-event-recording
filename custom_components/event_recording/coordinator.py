@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -52,29 +51,6 @@ from .recorder import (
 from .session import SessionCoordinator
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _inspect_staging_and_disk(media_root: Any) -> tuple[int, int]:
-    """Inspect unreserved staging bytes and physical disk free space."""
-    staging_bytes = 0
-    import shutil
-
-    root_path = Path(media_root)
-    staging_dir = root_path / ".staging"
-    if staging_dir.is_dir():
-        for p in staging_dir.iterdir():
-            try:
-                if p.is_file():
-                    staging_bytes += p.stat().st_size
-            except Exception:
-                pass
-    free_bytes = 0
-    try:
-        _total, _used, free = shutil.disk_usage(str(root_path))
-        free_bytes = free
-    except Exception:
-        pass
-    return staging_bytes, free_bytes
 
 
 class QueueOverflowError(Exception):
@@ -129,9 +105,7 @@ class DynamicSlotManager:
         async with self._cond:
             old_cap = self._capacity
             self._capacity = max(1, min(8, int(new_capacity)))
-            _LOGGER.debug(
-                "DynamicSlotManager capacity adjusted: %d -> %d", old_cap, self._capacity
-            )
+            _LOGGER.debug("DynamicSlotManager capacity adjusted: %d -> %d", old_cap, self._capacity)
             self._cond.notify_all()
 
     async def set_max_queue_depth(self, new_depth: int) -> None:
@@ -146,9 +120,7 @@ class DynamicSlotManager:
         """
         async with self._cond:
             if self._waiting >= self._max_queue_depth:
-                raise QueueOverflowError(
-                    f"Queue depth limit ({self._max_queue_depth}) exceeded"
-                )
+                raise QueueOverflowError(f"Queue depth limit ({self._max_queue_depth}) exceeded")
             self._waiting += 1
             _LOGGER.debug(
                 "DynamicSlotManager.acquire called: active=%d, waiting=%d, effective_capacity=%d, timeout=%s",
@@ -192,6 +164,7 @@ class DynamicSlotManager:
 
     def notify_capacity_changed(self) -> None:
         """Wake up any waiting tasks when capacity or quarantined count changes."""
+
         async def _notify() -> None:
             async with self._cond:
                 self._cond.notify_all()
@@ -256,7 +229,6 @@ class RecordingCoordinator:
         )
 
         self.admission_lock = asyncio.Lock()
-        self._capacity_lock = asyncio.Lock()
 
         # Stream adapters
         self.go2rtc_buffers = Go2rtcBufferManager(hass, entry)
@@ -264,16 +236,23 @@ class RecordingCoordinator:
         self.snapshot_adapter = SnapshotRecorderAdapter(hass, registry)
 
         # Specialized session and capture execution delegates
-        self.session_coordinator = SessionCoordinator(self.store)
+        self.session_coordinator = SessionCoordinator(self.store, clock=self.now)
         self._capture_executor = CaptureExecutor(self)
 
-        self._lookbacks: dict[str, float] = {}
         self._retention_at: float = 0.0
+        self._accounting_at: float = 0.0
 
         # Diagnostics metrics
         self.expired_captures_count = 0
         self.queue_timeouts_count = 0
         self.queue_overflow_count = 0
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def now(self) -> Any:
+        return utc_now()
 
     @property
     def slot_manager(self) -> DynamicSlotManager:
@@ -341,6 +320,19 @@ class RecordingCoordinator:
     async def set_max_queue_depth(self, new_depth: int) -> None:
         """Hot-adjust queue depth limit."""
         await self._slot_manager.set_max_queue_depth(new_depth)
+
+    async def apply_settings(self, entry: ConfigEntry) -> None:
+        """Apply every runtime limit through the same options-update boundary."""
+        self.entry = entry
+        retention_mb = self.max_storage_bytes // (1024 * 1024) or None
+        await asyncio.to_thread(
+            self.store.set_storage_policy,
+            StoragePolicy(min_disk_free_mb=self.min_disk_free_mb, retention_size_mb=retention_mb),
+        )
+        await self.set_max_parallel_resources(self.max_parallel_resources)
+        await self.set_max_queue_depth(self.max_queue_depth)
+        self.go2rtc_buffers.entry = entry
+        await self.go2rtc_buffers.reconcile()
 
     @property
     def queue_wait_timeout_seconds(self) -> float:
@@ -421,9 +413,7 @@ class RecordingCoordinator:
                 t.cancel()
 
         if self._resource_tasks:
-            await asyncio.gather(
-                *self._resource_tasks.values(), return_exceptions=True
-            )
+            await asyncio.gather(*self._resource_tasks.values(), return_exceptions=True)
         self._resource_tasks.clear()
 
         await self.go2rtc_buffers.stop()
@@ -470,9 +460,6 @@ class RecordingCoordinator:
                 await self.store.complete_record_intent(intent.intent_id, self.worker_id)
                 continue
 
-            if intent.lookback_seconds > 0.0 and intent.event_id:
-                self._lookbacks[intent.event_id] = intent.lookback_seconds
-
             self._pending_resources.add(intent.resource_key)
             await self.store.complete_record_intent(intent.intent_id, self.worker_id)
 
@@ -511,7 +498,7 @@ class RecordingCoordinator:
         """Run periodic storage ledger reconciliation and retention pruning."""
         loop = asyncio.get_running_loop()
         now_time = loop.time()
-        if now_time - self._retention_at < 60.0:
+        if self._retention_at and now_time - self._retention_at < 60.0:
             return
         self._retention_at = now_time
         _LOGGER.debug(
@@ -525,7 +512,12 @@ class RecordingCoordinator:
                 max_bytes=self.max_storage_bytes,
                 max_age_days=self.retention_days,
             )
-            await self.store.reconcile_storage_accounting()
+            await self.store.compact_recording_intents()
+            # Promotions/deletions update the ledger incrementally. A full disk walk
+            # is a repair audit, not part of every minute's retention pass.
+            if not self._accounting_at or now_time - self._accounting_at >= 3600.0:
+                await self.store.reconcile_storage_accounting()
+                self._accounting_at = now_time
         except Exception as err:
             _LOGGER.debug("Notice on periodic retention maintenance: %s", err)
 
@@ -550,6 +542,5 @@ __all__ = [
     "RecordingCoordinator",
     "ResourceQuarantinedError",
     "SessionCoordinator",
-    "_inspect_staging_and_disk",
     "utc_now",
 ]

@@ -356,10 +356,21 @@ class StorageLedger:
                         cols.add(r[1])
             has_file_name = "file_name" in cols
             if has_file_name:
-                cur.execute("SELECT file_name, size_bytes, available FROM media;")
+                cur.execute(
+                    "SELECT file_name, size_bytes, available FROM media WHERE available = 1;"
+                )
+                media_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='media_deletions';"
+                )
+                if cur.fetchone():
+                    cur.execute(
+                        "SELECT file_name, size_bytes, 1 AS available FROM media_deletions;"
+                    )
+                    media_rows.extend(cur.fetchall())
             else:
                 cur.execute("SELECT size_bytes, available FROM media;")
-            rows = cur.fetchall()
+            rows = media_rows if has_file_name else cur.fetchall()
             committed_bytes = 0
             committed_count = 0
             available_files: set[str] = set()
@@ -419,7 +430,9 @@ class StorageLedger:
             orphan_unreserved = 0
 
             def _raise_walk_error(err: OSError) -> None:
-                raise StorageCapacityError(f"Filesystem error inspecting '{media_root}': {err}") from err
+                raise StorageCapacityError(
+                    f"Filesystem error inspecting '{media_root}': {err}"
+                ) from err
 
             try:
                 if media_root.is_dir():
@@ -450,7 +463,9 @@ class StorageLedger:
                 if isinstance(walk_err, StorageCapacityError):
                     raise
                 if not isinstance(walk_err, FileNotFoundError):
-                    raise StorageCapacityError(f"Filesystem error inspecting '{media_root}': {walk_err}") from walk_err
+                    raise StorageCapacityError(
+                        f"Filesystem error inspecting '{media_root}': {walk_err}"
+                    ) from walk_err
 
             self._orphan_unreserved_bytes = orphan_unreserved
 

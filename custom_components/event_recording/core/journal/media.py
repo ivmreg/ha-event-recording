@@ -39,26 +39,6 @@ from .common import JournalStoreBase
 _LOGGER = logging.getLogger(__name__)
 
 
-def _safe_stage_and_promote_media(*args: Any, **kwargs: Any) -> Any:
-    """Stage and promote media, respecting dynamic module monkeypatching on core.store."""
-    import sys
-
-    store_mod = sys.modules.get("custom_components.event_recording.core.store")
-    if store_mod is not None and hasattr(store_mod, "stage_and_promote_media"):
-        return store_mod.stage_and_promote_media(*args, **kwargs)
-    return stage_and_promote_media(*args, **kwargs)
-
-
-def _safe_unlink_promoted_media(*args: Any, **kwargs: Any) -> Any:
-    """Unlink promoted media, respecting dynamic module monkeypatching on core.store."""
-    import sys
-
-    store_mod = sys.modules.get("custom_components.event_recording.core.store")
-    if store_mod is not None and hasattr(store_mod, "unlink_promoted_media"):
-        return store_mod.unlink_promoted_media(*args, **kwargs)
-    return unlink_promoted_media(*args, **kwargs)
-
-
 class MediaMixin(JournalStoreBase):
     """Encapsulates media lookup, staging reservations, and atomic promotion."""
 
@@ -121,15 +101,18 @@ class MediaMixin(JournalStoreBase):
             count = int(row["count"]) if row and row["count"] is not None else 0
             return {"committed_bytes": total_bytes, "media_count": count}
 
-    async def get_media(self, media_id: str) -> MediaItem | None:
+    async def get_media(self, media_id: str, event_id: str | None = None) -> MediaItem | None:
         """Fetch a media item by ID off event loop."""
-        return await asyncio.to_thread(self._sync_get_media, media_id)
+        return await asyncio.to_thread(self._sync_get_media, media_id, event_id)
 
-    def _sync_get_media(self, media_id: str) -> MediaItem | None:
+    def _sync_get_media(self, media_id: str, event_id: str | None = None) -> MediaItem | None:
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("SELECT * FROM media WHERE id = ?;", (media_id,))
+            cur.execute(
+                "SELECT * FROM media WHERE id = ? AND (? IS NULL OR event_id = ?);",
+                (media_id, event_id, event_id),
+            )
             row = cur.fetchone()
             if not row:
                 return None
@@ -150,9 +133,15 @@ class MediaMixin(JournalStoreBase):
                 is_pinned=has_pins,
                 content_hash=row["content_hash"],
                 created_at=ensure_utc(row["created_at"]),
-                requested_start=ensure_utc(row["requested_start"]) if row.get("requested_start") else None,
-                requested_end=ensure_utc(row["requested_end"]) if row.get("requested_end") else None,
-                capture_start=ensure_utc(row["capture_start"]) if row.get("capture_start") else None,
+                requested_start=ensure_utc(row["requested_start"])
+                if row.get("requested_start")
+                else None,
+                requested_end=ensure_utc(row["requested_end"])
+                if row.get("requested_end")
+                else None,
+                capture_start=ensure_utc(row["capture_start"])
+                if row.get("capture_start")
+                else None,
                 capture_end=ensure_utc(row["capture_end"]) if row.get("capture_end") else None,
                 time_quality=row.get("time_quality"),
                 clock_source=row.get("clock_source"),
@@ -530,7 +519,7 @@ class MediaMixin(JournalStoreBase):
                 media_id = str(uuid.uuid4())
                 ext = resolved_src.suffix or (".mp4" if final_kind == "video" else ".jpg")
                 stage_src = raw_src_path if adopt_staging else resolved_src
-                rel_file, size_bytes, content_hash = _safe_stage_and_promote_media(
+                rel_file, size_bytes, content_hash = stage_and_promote_media(
                     stage_src,
                     self._media_root,
                     event_id,
@@ -541,7 +530,7 @@ class MediaMixin(JournalStoreBase):
                 worker_state["rel_file"] = rel_file
 
                 if cancel_event.is_set():
-                    _safe_unlink_promoted_media(self._media_root, rel_file)
+                    unlink_promoted_media(self._media_root, rel_file)
                     return
 
                 # 4. Durable DB commit with single promotion owner
@@ -572,7 +561,7 @@ class MediaMixin(JournalStoreBase):
                 worker_state["error"] = exc
                 if worker_state["rel_file"]:
                     try:
-                        _safe_unlink_promoted_media(self._media_root, worker_state["rel_file"])
+                        unlink_promoted_media(self._media_root, worker_state["rel_file"])
                     except Exception:
                         pass
                 raise
@@ -696,9 +685,7 @@ class MediaMixin(JournalStoreBase):
                     4,
                 )
 
-                existing_coverage = (
-                    json.loads(row["coverage_json"]) if row["coverage_json"] else {}
-                )
+                existing_coverage = json.loads(row["coverage_json"]) if row["coverage_json"] else {}
                 preserved_uncertain = bool(
                     existing_coverage.get("is_uncertain", False)
                     or is_uncertain

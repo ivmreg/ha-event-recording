@@ -19,7 +19,6 @@ from ..models import (
     MediaPinLease,
     ReconcileResult,
     RetentionResult,
-    ensure_utc,
     format_iso,
     validate_bounded_string,
     validate_finite_number,
@@ -29,7 +28,6 @@ from .common import (
     DEFAULT_PIN_LEASE_SECONDS,
     MAX_PIN_LEASE_SECONDS,
     JournalStoreBase,
-    _safe_utc_now,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,7 +64,7 @@ class PinsRetentionMixin(JournalStoreBase):
         reason: str | None,
     ) -> MediaPinLease | None:
         clamped_seconds = max(1.0, min(float(lease_seconds), MAX_PIN_LEASE_SECONDS))
-        now_dt = _safe_utc_now()
+        now_dt = self.now()
         now_str = format_iso(now_dt) or ""
         expires_dt = now_dt + timedelta(seconds=clamped_seconds)
         expires_str = format_iso(expires_dt) or ""
@@ -81,6 +79,9 @@ class PinsRetentionMixin(JournalStoreBase):
             if not cur.fetchone():
                 return None
 
+            cur.execute("SELECT 1 FROM media_deletions WHERE event_id = ? LIMIT 1;", (event_id,))
+            if cur.fetchone():
+                return None
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 cur.execute(
@@ -132,9 +133,25 @@ class PinsRetentionMixin(JournalStoreBase):
         max_age_days: int | None = None,
     ) -> RetentionResult:
         """Enforce retention policies protecting active bounded pins and captures."""
-        res, notify_list = await asyncio.to_thread(
-            self._sync_enforce_retention, max_bytes, max_age_days
+        task = asyncio.create_task(
+            asyncio.to_thread(self._sync_enforce_retention, max_bytes, max_age_days)
         )
+        self._active_promotion_futures.add(task)
+        task.add_done_callback(self._active_promotion_futures.discard)
+        try:
+            res, notify_list = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Repeated shutdown cancellation must not cancel the thread's owner:
+            # close() waits for this task before closing SQLite.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            _result, notifications = task.result()
+            for event_id, revision in notifications:
+                self._notify_subscribers(event_id, revision)
+            raise
         for ev_id, rev in notify_list:
             self._notify_subscribers(ev_id, rev)
         return res
@@ -152,158 +169,175 @@ class PinsRetentionMixin(JournalStoreBase):
         max_bytes: int | None,
         max_age_days: int | None,
     ) -> tuple[RetentionResult, list[tuple[str, int]]]:
-        now_dt = _safe_utc_now()
-        now_str = format_iso(now_dt) or ""
-        deleted_files = 0
-        freed_bytes = 0
-        marked_expired = 0
-        marked_missing = 0
-        errors: list[str] = []
-        notifications: list[tuple[str, int]] = []
+        """Claim a bounded batch durably, unlink off-lock, then settle accounting.
 
+        Pin acquisition and claims serialize on the journal lock. Once claimed,
+        media is unavailable and new pins on that event fail until deletion settles.
+        Interrupted/failed unlinks remain in media_deletions for the next sweep.
+        """
+        with self._retention_lock:
+            claims, notifications, expired = self._sync_claim_retention(max_bytes, max_age_days)
+            deleted = missing = freed = 0
+            errors: list[str] = []
+            settled: list[dict[str, Any]] = []
+            for claim in claims:
+                try:
+                    target = (self._media_root / claim["file_name"]).resolve()
+                    if not target.is_relative_to(self._media_root):
+                        raise ValueError("Media deletion path escapes owned root")
+                    try:
+                        target.unlink()
+                        deleted += 1
+                        freed += claim["size_bytes"]
+                    except FileNotFoundError:
+                        missing += 1
+                    settled.append(claim)
+                except (OSError, ValueError) as err:
+                    errors.append(f"Failed to unlink media: {type(err).__name__}")
+
+            # Enumerate derived previews once, regardless of the number of clips.
+            affected = {claim["event_id"] for claim in settled}
+            thumbs = self._media_root / "thumbnails"
+            if affected and thumbs.is_dir() and not thumbs.is_symlink():
+                for thumb in thumbs.iterdir():
+                    event_id, sep, _revision = thumb.name.rpartition("_r")
+                    if sep and event_id in affected and thumb.name.endswith("_thumb.jpg"):
+                        try:
+                            if not thumb.is_symlink() and thumb.resolve().is_relative_to(
+                                self._media_root
+                            ):
+                                thumb.unlink(missing_ok=True)
+                        except OSError:
+                            errors.append("Failed to remove derived thumbnail")
+
+            with self._lock:
+                assert self._conn is not None
+                self._conn.execute("BEGIN IMMEDIATE;")
+                try:
+                    uncharged_bytes = uncharged_count = 0
+                    for claim in settled:
+                        cur = self._conn.execute(
+                            "DELETE FROM media_deletions WHERE media_id = ?;", (claim["media_id"],)
+                        )
+                        if cur.rowcount:
+                            uncharged_bytes += claim["size_bytes"]
+                            uncharged_count += 1
+                    self._conn.execute("COMMIT;")
+                    self.ledger.record_unlinked(uncharged_bytes, count=uncharged_count)
+                except Exception:
+                    self._conn.execute("ROLLBACK;")
+                    raise
+            return RetentionResult(
+                deleted_files=deleted,
+                freed_bytes=freed,
+                marked_expired_events=expired,
+                marked_missing_media=missing,
+                errors=errors,
+            ), notifications
+
+    def _sync_claim_retention(
+        self,
+        max_bytes: int | None,
+        max_age_days: int | None,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], list[tuple[str, int]], int]:
+        now = self.now()
+        now_str = format_iso(now)
+        cutoff = (
+            format_iso(now - timedelta(days=max_age_days)) if max_age_days is not None else None
+        )
+        notifications: list[tuple[str, int]] = []
+        expired = 0
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-
-            # Active pins and active captures are protected
-            cur.execute(
-                "SELECT DISTINCT event_id FROM media_pins WHERE expires_at > ?;", (now_str,)
-            )
-            pinned_ids = {r["event_id"] for r in cur.fetchall()}
-
-            cur.execute(
-                "SELECT event_id FROM events WHERE capture_state IN ('requested', 'recording');"
-            )
-            recording_ids = {r["event_id"] for r in cur.fetchall()}
-
-            protected_ids = pinned_ids | recording_ids
-
-            cur.execute("SELECT * FROM media WHERE available = 1 ORDER BY created_at ASC;")
-            all_media = cur.fetchall()
-
-            total_size = sum(m["size_bytes"] for m in all_media)
-            cutoff_dt = now_dt - timedelta(days=max_age_days) if max_age_days is not None else None
-
-            candidates_to_prune: list[dict[str, Any]] = []
-
-            for m in all_media:
-                if m["event_id"] in protected_ids:
-                    continue
-
-                m_created = ensure_utc(m["created_at"])
-                age_expired = cutoff_dt is not None and m_created < cutoff_dt
-                size_expired = max_bytes is not None and total_size > max_bytes
-
-                if age_expired or size_expired:
-                    candidates_to_prune.append(m)
-                    total_size -= m["size_bytes"]
-
-            if not candidates_to_prune:
-                return RetentionResult(), []
-
             cur.execute("BEGIN IMMEDIATE;")
             try:
-                for m in candidates_to_prune:
-                    file_path = (self._media_root / m["file_name"]).resolve()
-
-                    # Symlink directory escape guard
-                    try:
-                        if not file_path.is_relative_to(self._media_root):
-                            errors.append(f"Security error: path escape detected for {file_path}")
-                            continue
-                    except Exception as err:
-                        errors.append(f"Path verification error for {file_path}: {err}")
-                        continue
-
-                    # Unlink file if present
-                    unlink_success = False
-                    if file_path.exists():
-                        try:
-                            file_path.unlink()
-                            unlink_success = True
-                            deleted_files += 1
-                            freed_bytes += m["size_bytes"]
-                        except Exception as err:
-                            errors.append(f"Failed to unlink {file_path}: {err}")
-                    else:
-                        unlink_success = True
-                        marked_missing += 1
-
-                    if unlink_success:
-                        cur.execute("UPDATE media SET available = 0 WHERE id = ?;", (m["id"],))
-
-                        # Derived previews must expire with their source media
-                        thumbs = self._media_root / "thumbnails"
-                        if thumbs.is_dir() and not thumbs.is_symlink():
-                            for thumb in thumbs.iterdir():
-                                if (
-                                    thumb.name.startswith(f"{m['event_id']}_r")
-                                    and thumb.name.endswith("_thumb.jpg")
-                                    and not thumb.is_symlink()
-                                    and thumb.resolve().is_relative_to(self._media_root.resolve())
-                                ):
-                                    try:
-                                        thumb.unlink(missing_ok=True)
-                                    except OSError:
-                                        errors.append("Failed to remove derived thumbnail")
-
-                        # Check if event has any available media left
+                cur.execute(
+                    "SELECT * FROM media_deletions ORDER BY created_at, media_id LIMIT ?;", (limit,)
+                )
+                claims = cur.fetchall()
+                remaining = limit - len(claims)
+                cur.execute(
+                    "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM media WHERE available = 1;"
+                )
+                total = cur.fetchone()["total"]
+                if remaining and (
+                    cutoff is not None or (max_bytes is not None and total > max_bytes)
+                ):
+                    cur.execute(
+                        """
+                        SELECT m.* FROM media m JOIN events e ON e.event_id = m.event_id
+                        WHERE m.available = 1 AND e.capture_state NOT IN ('requested', 'recording')
+                          AND NOT EXISTS (SELECT 1 FROM media_pins p
+                              WHERE p.event_id = m.event_id AND p.expires_at > ?)
+                          AND (? IS NULL OR m.created_at < ? OR (? IS NOT NULL AND ? > ?))
+                        ORDER BY m.created_at, m.id LIMIT ?;
+                    """,
+                        (now_str, cutoff, cutoff, max_bytes, total, max_bytes, remaining),
+                    )
+                    candidates = cur.fetchall()
+                    affected: set[str] = set()
+                    for media in candidates:
+                        if not (
+                            (cutoff is not None and media["created_at"] < cutoff)
+                            or (max_bytes is not None and total > max_bytes)
+                        ):
+                            break
+                        cur.execute(
+                            "INSERT INTO media_deletions VALUES (?, ?, ?, ?, ?);",
+                            (
+                                media["id"],
+                                media["event_id"],
+                                media["file_name"],
+                                media["size_bytes"],
+                                now_str,
+                            ),
+                        )
+                        cur.execute("UPDATE media SET available = 0 WHERE id = ?;", (media["id"],))
+                        claims.append(
+                            dict(
+                                media_id=media["id"],
+                                event_id=media["event_id"],
+                                file_name=media["file_name"],
+                                size_bytes=media["size_bytes"],
+                            )
+                        )
+                        affected.add(media["event_id"])
+                        total -= media["size_bytes"]
+                    for event_id in affected:
                         cur.execute(
                             "SELECT 1 FROM media WHERE event_id = ? AND available = 1 LIMIT 1;",
-                            (m["event_id"],),
+                            (event_id,),
                         )
-                        if not cur.fetchone():
-                            cur.execute(
-                                """
-                                UPDATE events
-                                SET capture_state = 'expired', media_revision = media_revision + 1,
-                                    revision = revision + 1, updated_at = ?
-                                WHERE event_id = ?;
-                                """,
-                                (now_str, m["event_id"]),
-                            )
-                            marked_expired += 1
-                        else:
-                            cur.execute(
-                                """
-                                UPDATE events
-                                SET media_revision = media_revision + 1, revision = revision + 1, updated_at = ?
-                                WHERE event_id = ?;
-                                """,
-                                (now_str, m["event_id"]),
-                            )
-
+                        exhausted = cur.fetchone() is None
                         cur.execute(
-                            "SELECT revision FROM events WHERE event_id = ?;",
-                            (m["event_id"],),
+                            """UPDATE events SET
+                            capture_state = CASE WHEN ? THEN 'expired' ELSE capture_state END,
+                            media_revision = media_revision + 1, revision = revision + 1, updated_at = ?
+                            WHERE event_id = ? RETURNING revision;""",
+                            (exhausted, now_str, event_id),
                         )
-                        rev_row = cur.fetchone()
-                        if rev_row:
-                            notifications.append((m["event_id"], rev_row["revision"]))
-
+                        notifications.append((event_id, cur.fetchone()["revision"]))
+                        expired += int(exhausted)
+                cur.execute(
+                    "DELETE FROM media_pins WHERE pin_id IN (SELECT pin_id FROM media_pins WHERE expires_at <= ? LIMIT 1000);",
+                    (now_str,),
+                )
                 cur.execute("COMMIT;")
-                self.ledger.record_unlinked(freed_bytes, count=deleted_files)
             except Exception:
                 cur.execute("ROLLBACK;")
                 raise
-
-        return (
-            RetentionResult(
-                deleted_files=deleted_files,
-                freed_bytes=freed_bytes,
-                marked_expired_events=marked_expired,
-                marked_missing_media=marked_missing,
-                errors=errors,
-            ),
-            notifications,
-        )
+        return claims, notifications, expired
 
     async def reconcile(self, worker_id: str = "reconciler") -> ReconcileResult:
         """Recover cold-start ownership and clean orphans before capture workers start."""
-        return await asyncio.to_thread(self._sync_reconcile, worker_id)
+        result = await asyncio.to_thread(self._sync_reconcile, worker_id)
+        await self.enforce_retention()  # Retry claims left by an interrupted unlink.
+        return result
 
     def _sync_reconcile(self, worker_id: str) -> ReconcileResult:
-        now_dt = _safe_utc_now()
+        now_dt = self.now()
         now_str = format_iso(now_dt) or ""
         stale_threshold_str = format_iso(now_dt - timedelta(seconds=30)) or ""
 
@@ -390,7 +424,9 @@ class PinsRetentionMixin(JournalStoreBase):
                 raise
 
             # 4. Clean orphaned files in owned media root
-            cur.execute("SELECT file_name FROM media WHERE available = 1;")
+            cur.execute(
+                "SELECT file_name FROM media WHERE available = 1 UNION SELECT file_name FROM media_deletions;"
+            )
             indexed_rel_files = {Path(r["file_name"]).as_posix() for r in cur.fetchall()}
 
             staging_dir = (self._media_root / ".staging").resolve()

@@ -31,6 +31,7 @@ from .const import (
     WS_TYPE_SUBSCRIBE,
 )
 from .core.models import RecordedEvent, format_iso, to_public_dto, to_public_incident_dto, utc_now
+from .core.notifications import RevisionDispatcher
 from .core.store import JournalStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -131,7 +132,11 @@ async def ws_handle_events(
         "WS command event_recording/events: limit=%d, cursor=%s, filters=%s",
         limit,
         cursor,
-        {k: v for k, v in msg.items() if k not in ("type", "id", "limit", "cursor", "before_cursor")},
+        {
+            k: v
+            for k, v in msg.items()
+            if k not in ("type", "id", "limit", "cursor", "before_cursor")
+        },
     )
 
     filters: dict[str, Any] = {}
@@ -140,9 +145,7 @@ async def ws_handle_events(
     if "kind" in msg:
         filters["kind"] = msg["kind"]
     if "exclude_current_complete_annotation" in msg:
-        filters["exclude_current_complete_annotation"] = msg[
-            "exclude_current_complete_annotation"
-        ]
+        filters["exclude_current_complete_annotation"] = msg["exclude_current_complete_annotation"]
     if msg.get("exclude_journal_only") is True:
         filters["exclude_journal_only"] = True
 
@@ -302,7 +305,7 @@ async def ws_handle_subscribe(
         if not live_user or not getattr(live_user, "is_active", True):
             return
 
-        ev = await current_store.get_event(event_id)
+        ev = await current_store.get_event_access(event_id)
         if ev and is_user_authorized_for_event(live_user, ev):
             connection.send_message(
                 websocket_api.event_message(
@@ -314,10 +317,16 @@ async def ws_handle_subscribe(
                 )
             )
 
-    def _sync_cb(event_id: str, revision: int) -> None:
-        hass.async_create_task(_on_event_update(event_id, revision))
+    async def _catch_up() -> None:
+        connection.send_message(websocket_api.event_message(msg["id"], {"refresh": True}))
 
-    unsub = store.subscribe(_sync_cb)
+    dispatcher = RevisionDispatcher(_on_event_update, _catch_up)
+    unsubscribe = store.subscribe(dispatcher.notify)
+
+    def unsub() -> None:
+        unsubscribe()
+        dispatcher.close()
+
     connection.subscriptions[msg["id"]] = unsub
     connection.send_result(msg["id"])
 
@@ -584,9 +593,7 @@ def _matches_activity_exclusion(
     payload = ann.get("payload")
     if not isinstance(payload, dict):
         payload = {
-            k: v
-            for k, v in ann.items()
-            if k not in ("worker_id", "reserved_by", "reserved_until")
+            k: v for k, v in ann.items() if k not in ("worker_id", "reserved_by", "reserved_until")
         }
     return payload.get(field) == expected
 
