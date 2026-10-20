@@ -92,7 +92,7 @@ Validate configuration and restart after this manual change. Use your actual con
 1. In Home Assistant, navigate to **Settings -> Dashboards -> Resources** (or menu dots in Lovelace UI -> Manage resources).
 2. Click **Add Resource**.
 3. Fill in the resource details:
-   - **URL:** `/event_recording/event-card.js`
+   - **URL:** `/event_recording/event-card.js?v=0.7.1`
    - **Resource Type:** `JavaScript Module`
 4. Click **Create**.
 5. You can now add the card to any Lovelace view:
@@ -100,6 +100,9 @@ Validate configuration and restart after this manual change. Use your actual con
    type: custom:event-recording-card
    page_size: 25
    ```
+
+> [!TIP]
+> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.1`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
 
 ---
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 DOMAIN = "event_recording"
-VERSION = "0.5.0"
 
 # Configuration and options
 CONF_MEDIA_ROOT = "media_root"
