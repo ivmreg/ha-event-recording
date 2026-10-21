@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ try:
 except ImportError:
     import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant import config_entries, data_entry_flow
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import entity_registry, selector
@@ -88,6 +89,96 @@ from .core.validation import (
 )
 from .validation import number_spec_selector
 
+# Native Home Assistant form section ids. Sections are presentation only: all
+# values are stored as flat option keys, never nested under these ids.
+SECTION_CONNECTION = "connection"
+SECTION_ADVANCED = "advanced"
+SECTION_CORRELATION = "correlation"
+SECTION_TIMING = "timing"
+SECTION_PROVIDER = "provider"
+
+_GLOBAL_SECTION_IDS = frozenset({SECTION_CONNECTION, SECTION_ADVANCED, SECTION_CORRELATION})
+_CAMERA_SECTION_IDS = frozenset({SECTION_TIMING, SECTION_PROVIDER, SECTION_CORRELATION})
+
+# Map submitted fields to the section that renders them, so a validation error
+# can re-open the section that holds the invalid field.
+_GLOBAL_FIELD_SECTIONS = {
+    CONF_GO2RTC_BASE_URL: SECTION_CONNECTION,
+    CONF_GO2RTC_USERNAME: SECTION_CONNECTION,
+    CONF_GO2RTC_PASSWORD: SECTION_CONNECTION,
+    "clear_go2rtc_password": SECTION_CONNECTION,
+    CONF_MAX_PARALLEL_RESOURCES: SECTION_ADVANCED,
+    CONF_MAX_QUEUE_DEPTH: SECTION_ADVANCED,
+    CONF_QUEUE_WAIT_TIMEOUT_SECONDS: SECTION_ADVANCED,
+    CONF_ENABLE_DEBUG_LOGGING: SECTION_ADVANCED,
+    CONF_ENABLE_AUTO_ASSOCIATION: SECTION_CORRELATION,
+    CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS: SECTION_CORRELATION,
+    CONF_MAX_INCIDENT_SPAN_SECONDS: SECTION_CORRELATION,
+}
+
+_CAMERA_FIELD_SECTIONS = {
+    "lookback_seconds": SECTION_TIMING,
+    "chunk_seconds": SECTION_TIMING,
+    CONF_GO2RTC_STREAM: SECTION_PROVIDER,
+    CONF_FRIGATE_BASE_URL: SECTION_PROVIDER,
+    CONF_FRIGATE_CAMERA_NAME: SECTION_PROVIDER,
+    CONF_FRIGATE_AUTH_TOKEN: SECTION_PROVIDER,
+    "clear_frigate_auth_token": SECTION_PROVIDER,
+    CONF_EXPORT_DELAY_SECONDS: SECTION_PROVIDER,
+    "ownership_group": SECTION_CORRELATION,
+    "correlation_group": SECTION_CORRELATION,
+    "zone": SECTION_CORRELATION,
+    "adjacent_zones": SECTION_CORRELATION,
+    "source_clock_offset_seconds": SECTION_CORRELATION,
+    "source_time_uncertainty_seconds": SECTION_CORRELATION,
+}
+
+_CAMERA_FORM_FIELDS = frozenset(
+    {
+        "camera_entity",
+        "source_id",
+        "label",
+        "recording_mode",
+        CONF_RECORDING_PROVIDER,
+        "window_seconds",
+        "max_window_seconds",
+        *_CAMERA_FIELD_SECTIONS,
+    }
+)
+
+
+def _form_number(value: Any, default: Any) -> Any:
+    """Return a form default without discarding an attempted invalid value."""
+    if value is None or value == "" or isinstance(value, bool):
+        return default
+    if isinstance(value, float) and not math.isfinite(value):
+        return default
+    return value
+
+
+def _flatten_sections(
+    user_input: Mapping[str, Any], section_ids: frozenset[str]
+) -> dict[str, Any]:
+    """Flatten one level of native form sections into plain option keys."""
+    flat: dict[str, Any] = {}
+    for key, value in user_input.items():
+        if key in section_ids and isinstance(value, Mapping):
+            flat.update(value)
+        else:
+            flat[key] = value
+    return flat
+
+
+def _sections_with_errors(
+    errors: Mapping[str, str], field_sections: Mapping[str, str]
+) -> set[str]:
+    """Return the sections that should start expanded for the given errors."""
+    return {
+        field_sections[field]
+        for field in errors
+        if field in field_sections
+    }
+
 
 def validate_media_root(hass: Any, raw_media: str) -> str | None:
     """Validate media_root is not inside www or configured media_dirs.
@@ -154,18 +245,33 @@ class EventRecordingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data=user_input,
                 )
 
+        # Re-render the form with the attempted values (never a credential echo).
+        displayed = dict(user_input) if user_input is not None else {}
         schema = vol.Schema(
             {
-                vol.Required(CONF_MEDIA_ROOT, default=DEFAULT_MEDIA_DIR): str,
-                vol.Required(CONF_RETENTION_SIZE_MB, default=DEFAULT_RETENTION_SIZE_MB): number_spec_selector(
-                    SPEC_RETENTION_SIZE_MB
-                ),
-                vol.Required(CONF_RETENTION_DAYS, default=DEFAULT_RETENTION_DAYS): number_spec_selector(
-                    SPEC_RETENTION_DAYS
-                ),
-                vol.Required(CONF_CHUNK_SECONDS, default=DEFAULT_CHUNK_SECONDS): number_spec_selector(
-                    SPEC_CHUNK_SECONDS
-                ),
+                vol.Required(
+                    CONF_MEDIA_ROOT,
+                    default=str(displayed.get(CONF_MEDIA_ROOT, DEFAULT_MEDIA_DIR)),
+                ): str,
+                vol.Required(
+                    CONF_RETENTION_SIZE_MB,
+                    default=_form_number(
+                        displayed.get(CONF_RETENTION_SIZE_MB),
+                        DEFAULT_RETENTION_SIZE_MB,
+                    ),
+                ): number_spec_selector(SPEC_RETENTION_SIZE_MB),
+                vol.Required(
+                    CONF_RETENTION_DAYS,
+                    default=_form_number(
+                        displayed.get(CONF_RETENTION_DAYS), DEFAULT_RETENTION_DAYS
+                    ),
+                ): number_spec_selector(SPEC_RETENTION_DAYS),
+                vol.Required(
+                    CONF_CHUNK_SECONDS,
+                    default=_form_number(
+                        displayed.get(CONF_CHUNK_SECONDS), DEFAULT_CHUNK_SECONDS
+                    ),
+                ): number_spec_selector(SPEC_CHUNK_SECONDS),
             }
         )
 
@@ -199,88 +305,50 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         return super().config_entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Show the options menu."""
+        """Show the options menu with distinct actions available directly."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["recording_settings", "storage_settings", "go2rtc_settings", "cameras", "effective_config"],
+            menu_options=[
+                "settings",
+                "camera_add",
+                "camera_edit",
+                "camera_remove",
+                "effective_config",
+            ],
         )
 
-    async def async_step_go2rtc_settings(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Configure the shared go2rtc connection without probing it."""
+    async def async_step_settings(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Review and save every global recording setting in a single form."""
+        current = self._global_current()
         errors: dict[str, str] = {}
-        entry = self.config_entry
-        if user_input is not None:
-            raw_url = str(user_input.get(CONF_GO2RTC_BASE_URL, "")).strip()
-            username = str(user_input.get(CONF_GO2RTC_USERNAME, "")).strip()
-            password_value = user_input.get(CONF_GO2RTC_PASSWORD, "")
-            password = password_value if isinstance(password_value, str) else ""
-            clear_password = bool(user_input.pop("clear_go2rtc_password", False))
-            effective_password = None if clear_password else (
-                password or entry.options.get(CONF_GO2RTC_PASSWORD)
-            )
-            if raw_url:
-                try:
-                    user_input[CONF_GO2RTC_BASE_URL] = validate_go2rtc_base_url(raw_url)
-                except ValueError:
-                    errors[CONF_GO2RTC_BASE_URL] = "invalid_go2rtc_base_url"
-            else:
-                user_input[CONF_GO2RTC_BASE_URL] = None
-            if bool(username) != bool(effective_password):
-                errors[CONF_GO2RTC_USERNAME] = "go2rtc_credentials_incomplete"
-            user_input[CONF_GO2RTC_USERNAME] = username or None
-            if clear_password:
-                user_input[CONF_GO2RTC_PASSWORD] = None
-            elif password:
-                user_input[CONF_GO2RTC_PASSWORD] = password
-            else:
-                user_input[CONF_GO2RTC_PASSWORD] = effective_password
-            if not errors:
-                saved = self._current_options()
-                saved.update(user_input)
-                saved.pop("clear_go2rtc_password", None)
-                return self.async_create_entry(title="", data=saved)
-
-        options = entry.options
-        schema = vol.Schema(
-            {
-                vol.Optional(CONF_GO2RTC_BASE_URL, default=options.get(CONF_GO2RTC_BASE_URL) or ""): str,
-                vol.Optional(CONF_GO2RTC_USERNAME, default=options.get(CONF_GO2RTC_USERNAME) or ""): str,
-                vol.Optional(CONF_GO2RTC_PASSWORD, default=""): selector.TextSelector(
-                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
-                ),
-                vol.Optional("clear_go2rtc_password", default=False): bool,
-            }
-        )
-        return self.async_show_form(step_id="go2rtc_settings", data_schema=schema, errors=errors)
-
-    async def async_step_recording_settings(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Manage global recording concurrency and queue limits."""
-        errors: dict[str, str] = {}
+        submitted: dict[str, Any] = {}
 
         if user_input is not None:
+            submitted = _flatten_sections(user_input, _GLOBAL_SECTION_IDS)
+            values: dict[str, Any] = {}
+
             for field, spec, err_key in (
                 (CONF_CHUNK_SECONDS, SPEC_CHUNK_SECONDS, "invalid_chunk_seconds"),
-                (CONF_MAX_PARALLEL_RESOURCES, SPEC_MAX_PARALLEL_RESOURCES, "invalid_max_parallel"),
+                (CONF_RETENTION_SIZE_MB, SPEC_RETENTION_SIZE_MB, "retention_size_too_low"),
+                (CONF_RETENTION_DAYS, SPEC_RETENTION_DAYS, "retention_days_too_low"),
+                (CONF_MIN_DISK_FREE_MB, SPEC_MIN_DISK_FREE_MB, "min_disk_free_too_low"),
+                (
+                    CONF_MAX_PARALLEL_RESOURCES,
+                    SPEC_MAX_PARALLEL_RESOURCES,
+                    "invalid_max_parallel",
+                ),
                 (CONF_MAX_QUEUE_DEPTH, SPEC_MAX_QUEUE_DEPTH, "invalid_max_queue_depth"),
-                (CONF_QUEUE_WAIT_TIMEOUT_SECONDS, SPEC_QUEUE_WAIT_TIMEOUT_SECONDS, "invalid_queue_timeout"),
+                (
+                    CONF_QUEUE_WAIT_TIMEOUT_SECONDS,
+                    SPEC_QUEUE_WAIT_TIMEOUT_SECONDS,
+                    "invalid_queue_timeout",
+                ),
             ):
                 try:
-                    user_input[field] = int(spec.validate(user_input.get(field, spec.default)))
+                    values[field] = int(spec.validate(submitted.get(field, current[field])))
                 except (ValidationError, ValueError, TypeError):
                     errors[field] = err_key
 
-            if CONF_ENABLE_AUTO_ASSOCIATION in user_input:
-                user_input[CONF_ENABLE_AUTO_ASSOCIATION] = bool(
-                    user_input[CONF_ENABLE_AUTO_ASSOCIATION]
-                )
-            if CONF_ENABLE_DEBUG_LOGGING in user_input:
-                user_input[CONF_ENABLE_DEBUG_LOGGING] = bool(
-                    user_input[CONF_ENABLE_DEBUG_LOGGING]
-                )
             for field, spec, err_key in (
                 (
                     CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
@@ -293,259 +361,242 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                     "invalid_max_incident_span",
                 ),
             ):
-                if field in user_input:
-                    try:
-                        user_input[field] = float(spec.validate(user_input[field]))
-                    except (ValidationError, ValueError, TypeError):
-                        errors[field] = err_key
-
-            if not errors:
-                return self.async_create_entry(
-                    title="", data={**self._current_options(), **user_input}
-                )
-
-        entry = self.config_entry
-        current_chunk = entry.options.get(
-            CONF_CHUNK_SECONDS,
-            entry.data.get(CONF_CHUNK_SECONDS, DEFAULT_CHUNK_SECONDS),
-        )
-        current_parallel = entry.options.get(
-            CONF_MAX_PARALLEL_RESOURCES,
-            entry.data.get(CONF_MAX_PARALLEL_RESOURCES, DEFAULT_MAX_PARALLEL_RESOURCES),
-        )
-        current_queue_depth = entry.options.get(
-            CONF_MAX_QUEUE_DEPTH,
-            entry.data.get(CONF_MAX_QUEUE_DEPTH, DEFAULT_MAX_QUEUE_DEPTH),
-        )
-        current_queue_timeout = entry.options.get(
-            CONF_QUEUE_WAIT_TIMEOUT_SECONDS,
-            entry.data.get(
-                CONF_QUEUE_WAIT_TIMEOUT_SECONDS, DEFAULT_QUEUE_WAIT_TIMEOUT_SECONDS
-            ),
-        )
-        current_enable_auto = entry.options.get(
-            CONF_ENABLE_AUTO_ASSOCIATION,
-            entry.data.get(CONF_ENABLE_AUTO_ASSOCIATION, DEFAULT_ENABLE_AUTO_ASSOCIATION),
-        )
-        current_auto_tol = entry.options.get(
-            CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
-            entry.data.get(
-                CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
-                DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
-            ),
-        )
-        current_max_span = entry.options.get(
-            CONF_MAX_INCIDENT_SPAN_SECONDS,
-            entry.data.get(
-                CONF_MAX_INCIDENT_SPAN_SECONDS,
-                DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
-            ),
-        )
-        current_debug_logging = entry.options.get(
-            CONF_ENABLE_DEBUG_LOGGING,
-            entry.data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING),
-        )
-
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_CHUNK_SECONDS, default=current_chunk): number_spec_selector(
-                    SPEC_CHUNK_SECONDS
-                ),
-                vol.Required(CONF_MAX_PARALLEL_RESOURCES, default=current_parallel): number_spec_selector(
-                    SPEC_MAX_PARALLEL_RESOURCES
-                ),
-                vol.Required(CONF_MAX_QUEUE_DEPTH, default=current_queue_depth): number_spec_selector(
-                    SPEC_MAX_QUEUE_DEPTH
-                ),
-                vol.Required(
-                    CONF_QUEUE_WAIT_TIMEOUT_SECONDS, default=current_queue_timeout
-                ): number_spec_selector(SPEC_QUEUE_WAIT_TIMEOUT_SECONDS),
-                vol.Required(CONF_ENABLE_AUTO_ASSOCIATION, default=bool(current_enable_auto)): bool,
-                vol.Required(
-                    CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS, default=float(current_auto_tol)
-                ): number_spec_selector(SPEC_AUTO_ASSOCIATION_TOLERANCE_SECONDS, step=1.0),
-                vol.Required(
-                    CONF_MAX_INCIDENT_SPAN_SECONDS, default=float(current_max_span)
-                ): number_spec_selector(SPEC_MAX_INCIDENT_SPAN_SECONDS, step=10.0),
-                vol.Required(
-                    CONF_ENABLE_DEBUG_LOGGING, default=bool(current_debug_logging)
-                ): bool,
-            }
-        )
-
-        return self.async_show_form(
-            step_id="recording_settings",
-            data_schema=schema,
-            errors=errors,
-        )
-
-    async def async_step_storage_settings(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Manage global storage retention and disk floor settings."""
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            for field, spec, err_key in (
-                (CONF_MIN_DISK_FREE_MB, SPEC_MIN_DISK_FREE_MB, "min_disk_free_too_low"),
-                (CONF_RETENTION_SIZE_MB, SPEC_RETENTION_SIZE_MB, "retention_size_too_low"),
-                (CONF_RETENTION_DAYS, SPEC_RETENTION_DAYS, "retention_days_too_low"),
-            ):
                 try:
-                    user_input[field] = int(spec.validate(user_input.get(field, spec.default)))
+                    values[field] = float(spec.validate(submitted.get(field, current[field])))
                 except (ValidationError, ValueError, TypeError):
                     errors[field] = err_key
 
+            for flag in (CONF_ENABLE_AUTO_ASSOCIATION, CONF_ENABLE_DEBUG_LOGGING):
+                values[flag] = bool(submitted.get(flag, current[flag]))
+
+            raw_url = str(
+                submitted.get(CONF_GO2RTC_BASE_URL, current[CONF_GO2RTC_BASE_URL]) or ""
+            ).strip()
+            username = str(
+                submitted.get(CONF_GO2RTC_USERNAME, current[CONF_GO2RTC_USERNAME]) or ""
+            ).strip()
+            password_value = submitted.get(CONF_GO2RTC_PASSWORD, "")
+            password = password_value if isinstance(password_value, str) else ""
+            clear_password = bool(submitted.get("clear_go2rtc_password", False))
+            saved_password = current[CONF_GO2RTC_PASSWORD]
+            effective_password = None if clear_password else (password or saved_password)
+
+            if raw_url:
+                try:
+                    values[CONF_GO2RTC_BASE_URL] = validate_go2rtc_base_url(raw_url)
+                except ValueError:
+                    errors[CONF_GO2RTC_BASE_URL] = "invalid_go2rtc_base_url"
+            else:
+                values[CONF_GO2RTC_BASE_URL] = None
+            if bool(username) != bool(effective_password):
+                errors[CONF_GO2RTC_USERNAME] = "go2rtc_credentials_incomplete"
+            values[CONF_GO2RTC_USERNAME] = username or None
+            if clear_password:
+                values[CONF_GO2RTC_PASSWORD] = None
+            elif password:
+                values[CONF_GO2RTC_PASSWORD] = password
+            else:
+                values[CONF_GO2RTC_PASSWORD] = saved_password
+
             if not errors:
-                return self.async_create_entry(
-                    title="", data={**self._current_options(), **user_input}
-                )
+                options = self._current_options()
+                options.update(values)
+                return self.async_create_entry(title="", data=options)
 
-        entry = self.config_entry
-        current_size = entry.options.get(
-            CONF_RETENTION_SIZE_MB,
-            entry.data.get(CONF_RETENTION_SIZE_MB, DEFAULT_RETENTION_SIZE_MB),
-        )
-        current_days = entry.options.get(
-            CONF_RETENTION_DAYS,
-            entry.data.get(CONF_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
-        )
-        current_min_disk = entry.options.get(
-            CONF_MIN_DISK_FREE_MB,
-            entry.data.get(CONF_MIN_DISK_FREE_MB, DEFAULT_MIN_DISK_FREE_MB),
-        )
-
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_RETENTION_SIZE_MB, default=current_size): number_spec_selector(
-                    SPEC_RETENTION_SIZE_MB
-                ),
-                vol.Required(CONF_RETENTION_DAYS, default=current_days): number_spec_selector(
-                    SPEC_RETENTION_DAYS
-                ),
-                vol.Required(
-                    CONF_MIN_DISK_FREE_MB, default=max(50, current_min_disk)
-                ): number_spec_selector(SPEC_MIN_DISK_FREE_MB),
-            }
+        displayed = {**current, **submitted}
+        # Never echo a stored or attempted secret back into the form.
+        displayed[CONF_GO2RTC_PASSWORD] = ""
+        schema = self._settings_schema(
+            displayed, _sections_with_errors(errors, _GLOBAL_FIELD_SECTIONS)
         )
 
         return self.async_show_form(
-            step_id="storage_settings",
+            step_id="settings",
             data_schema=schema,
             errors=errors,
+            description_placeholders=self._summary_placeholders(displayed),
         )
 
-    async def async_step_effective_config(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Display read-only effective configuration and operational formulas."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=self._current_options())
+    @staticmethod
+    def _settings_schema(displayed: dict[str, Any], expanded: set[str]) -> Any:
+        """Build the single global settings form with collapsed advanced groups."""
+        connection = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_GO2RTC_BASE_URL, default=str(displayed.get(CONF_GO2RTC_BASE_URL) or "")
+                ): str,
+                vol.Optional(
+                    CONF_GO2RTC_USERNAME, default=str(displayed.get(CONF_GO2RTC_USERNAME) or "")
+                ): str,
+                vol.Optional(CONF_GO2RTC_PASSWORD, default=""): selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+                ),
+                vol.Optional("clear_go2rtc_password", default=False): selector.BooleanSelector(),
+            }
+        )
+        advanced = vol.Schema(
+            {
+                vol.Required(
+                    CONF_MAX_PARALLEL_RESOURCES,
+                    default=displayed[CONF_MAX_PARALLEL_RESOURCES],
+                ): number_spec_selector(SPEC_MAX_PARALLEL_RESOURCES),
+                vol.Required(
+                    CONF_MAX_QUEUE_DEPTH, default=displayed[CONF_MAX_QUEUE_DEPTH]
+                ): number_spec_selector(SPEC_MAX_QUEUE_DEPTH),
+                vol.Required(
+                    CONF_QUEUE_WAIT_TIMEOUT_SECONDS,
+                    default=displayed[CONF_QUEUE_WAIT_TIMEOUT_SECONDS],
+                ): number_spec_selector(SPEC_QUEUE_WAIT_TIMEOUT_SECONDS),
+                vol.Required(
+                    CONF_ENABLE_DEBUG_LOGGING,
+                    default=bool(displayed[CONF_ENABLE_DEBUG_LOGGING]),
+                ): selector.BooleanSelector(),
+            }
+        )
+        correlation = vol.Schema(
+            {
+                vol.Required(
+                    CONF_ENABLE_AUTO_ASSOCIATION,
+                    default=bool(displayed[CONF_ENABLE_AUTO_ASSOCIATION]),
+                ): selector.BooleanSelector(),
+                vol.Required(
+                    CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+                    default=float(displayed[CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS]),
+                ): number_spec_selector(SPEC_AUTO_ASSOCIATION_TOLERANCE_SECONDS, step=1.0),
+                vol.Required(
+                    CONF_MAX_INCIDENT_SPAN_SECONDS,
+                    default=float(displayed[CONF_MAX_INCIDENT_SPAN_SECONDS]),
+                ): number_spec_selector(SPEC_MAX_INCIDENT_SPAN_SECONDS, step=10.0),
+            }
+        )
+        return vol.Schema(
+            {
+                vol.Required(
+                    CONF_CHUNK_SECONDS, default=displayed[CONF_CHUNK_SECONDS]
+                ): number_spec_selector(SPEC_CHUNK_SECONDS),
+                vol.Required(
+                    CONF_RETENTION_SIZE_MB, default=displayed[CONF_RETENTION_SIZE_MB]
+                ): number_spec_selector(SPEC_RETENTION_SIZE_MB),
+                vol.Required(
+                    CONF_RETENTION_DAYS, default=displayed[CONF_RETENTION_DAYS]
+                ): number_spec_selector(SPEC_RETENTION_DAYS),
+                vol.Required(
+                    CONF_MIN_DISK_FREE_MB, default=displayed[CONF_MIN_DISK_FREE_MB]
+                ): number_spec_selector(SPEC_MIN_DISK_FREE_MB),
+                vol.Required(SECTION_CONNECTION): data_entry_flow.section(
+                    connection, {"collapsed": SECTION_CONNECTION not in expanded}
+                ),
+                vol.Required(SECTION_ADVANCED): data_entry_flow.section(
+                    advanced, {"collapsed": SECTION_ADVANCED not in expanded}
+                ),
+                vol.Required(SECTION_CORRELATION): data_entry_flow.section(
+                    correlation, {"collapsed": SECTION_CORRELATION not in expanded}
+                ),
+            }
+        )
 
+    def _summary_placeholders(self, displayed: Mapping[str, Any]) -> dict[str, str]:
+        """Return a concise, secret-free summary for the settings description."""
+        return {
+            "media_root": self._resolved_media_root(),
+            "summary": (
+                f"{displayed[CONF_CHUNK_SECONDS]}s chunks, "
+                f"{displayed[CONF_RETENTION_SIZE_MB]} MB / "
+                f"{displayed[CONF_RETENTION_DAYS]} days retention, "
+                f"{len(self._profiles())} camera profile(s)"
+            ),
+        }
+
+    def _global_current(self) -> dict[str, Any]:
+        """Return current global settings, falling back to legacy entry data."""
         entry = self.config_entry
-        config_root = Path(self.hass.config.path()).resolve()
+
+        def stored(key: str, default: Any) -> Any:
+            return entry.options.get(key, entry.data.get(key, default))
+
+        return {
+            CONF_CHUNK_SECONDS: int(stored(CONF_CHUNK_SECONDS, DEFAULT_CHUNK_SECONDS)),
+            CONF_RETENTION_SIZE_MB: int(
+                stored(CONF_RETENTION_SIZE_MB, DEFAULT_RETENTION_SIZE_MB)
+            ),
+            CONF_RETENTION_DAYS: int(stored(CONF_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)),
+            CONF_MIN_DISK_FREE_MB: int(
+                stored(CONF_MIN_DISK_FREE_MB, DEFAULT_MIN_DISK_FREE_MB)
+            ),
+            CONF_MAX_PARALLEL_RESOURCES: int(
+                stored(CONF_MAX_PARALLEL_RESOURCES, DEFAULT_MAX_PARALLEL_RESOURCES)
+            ),
+            CONF_MAX_QUEUE_DEPTH: int(
+                stored(CONF_MAX_QUEUE_DEPTH, DEFAULT_MAX_QUEUE_DEPTH)
+            ),
+            CONF_QUEUE_WAIT_TIMEOUT_SECONDS: int(
+                stored(CONF_QUEUE_WAIT_TIMEOUT_SECONDS, DEFAULT_QUEUE_WAIT_TIMEOUT_SECONDS)
+            ),
+            CONF_ENABLE_AUTO_ASSOCIATION: bool(
+                stored(CONF_ENABLE_AUTO_ASSOCIATION, DEFAULT_ENABLE_AUTO_ASSOCIATION)
+            ),
+            CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS: float(
+                stored(
+                    CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+                    DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
+                )
+            ),
+            CONF_MAX_INCIDENT_SPAN_SECONDS: float(
+                stored(CONF_MAX_INCIDENT_SPAN_SECONDS, DEFAULT_MAX_INCIDENT_SPAN_SECONDS)
+            ),
+            CONF_ENABLE_DEBUG_LOGGING: bool(
+                stored(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING)
+            ),
+            CONF_GO2RTC_BASE_URL: stored(CONF_GO2RTC_BASE_URL, "") or "",
+            CONF_GO2RTC_USERNAME: stored(CONF_GO2RTC_USERNAME, "") or "",
+            CONF_GO2RTC_PASSWORD: stored(CONF_GO2RTC_PASSWORD, None),
+        }
+
+    def _resolved_media_root(self) -> str:
+        """Return the read-only media root for the summary (never editable here)."""
+        entry = self.config_entry
         raw_media = str(
             entry.options.get(
                 CONF_MEDIA_ROOT,
                 entry.data.get(CONF_MEDIA_ROOT, DEFAULT_MEDIA_DIR),
             )
         )
-        resolved_media = (
-            Path(raw_media) if Path(raw_media).is_absolute() else (config_root / raw_media)
-        ).resolve()
+        config_root = Path(self.hass.config.path()).resolve()
+        return str(
+            (
+                Path(raw_media) if Path(raw_media).is_absolute() else config_root / raw_media
+            ).resolve()
+        )
 
-        chunk_seconds = int(
-            entry.options.get(
-                CONF_CHUNK_SECONDS,
-                entry.data.get(CONF_CHUNK_SECONDS, DEFAULT_CHUNK_SECONDS),
-            )
-        )
-        max_parallel = int(
-            entry.options.get(
-                CONF_MAX_PARALLEL_RESOURCES,
-                entry.data.get(
-                    CONF_MAX_PARALLEL_RESOURCES, DEFAULT_MAX_PARALLEL_RESOURCES
-                ),
-            )
-        )
-        max_queue = int(
-            entry.options.get(
-                CONF_MAX_QUEUE_DEPTH,
-                entry.data.get(CONF_MAX_QUEUE_DEPTH, DEFAULT_MAX_QUEUE_DEPTH),
-            )
-        )
-        queue_timeout = int(
-            entry.options.get(
-                CONF_QUEUE_WAIT_TIMEOUT_SECONDS,
-                entry.data.get(
-                    CONF_QUEUE_WAIT_TIMEOUT_SECONDS,
-                    DEFAULT_QUEUE_WAIT_TIMEOUT_SECONDS,
-                ),
-            )
-        )
-        retention_size = int(
-            entry.options.get(
-                CONF_RETENTION_SIZE_MB,
-                entry.data.get(CONF_RETENTION_SIZE_MB, DEFAULT_RETENTION_SIZE_MB),
-            )
-        )
-        retention_days = int(
-            entry.options.get(
-                CONF_RETENTION_DAYS,
-                entry.data.get(CONF_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
-            )
-        )
-        min_disk = int(
-            entry.options.get(
-                CONF_MIN_DISK_FREE_MB,
-                entry.data.get(CONF_MIN_DISK_FREE_MB, DEFAULT_MIN_DISK_FREE_MB),
-            )
-        )
+    async def async_step_effective_config(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Display a read-only configuration summary; saving keeps options as-is."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=self._current_options())
+
+        current = self._global_current()
         profiles = self._profiles()
-
-        enable_auto = bool(
-            entry.options.get(
-                CONF_ENABLE_AUTO_ASSOCIATION,
-                entry.data.get(CONF_ENABLE_AUTO_ASSOCIATION, DEFAULT_ENABLE_AUTO_ASSOCIATION),
-            )
-        )
-        tolerance = float(
-            entry.options.get(
-                CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
-                entry.data.get(
-                    CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
-                    DEFAULT_AUTO_ASSOCIATION_TOLERANCE_SECONDS,
-                ),
-            )
-        )
-        max_span = float(
-            entry.options.get(
-                CONF_MAX_INCIDENT_SPAN_SECONDS,
-                entry.data.get(
-                    CONF_MAX_INCIDENT_SPAN_SECONDS,
-                    DEFAULT_MAX_INCIDENT_SPAN_SECONDS,
-                ),
-            )
-        )
         auto_assoc_str = (
-            f"enabled (tolerance: {tolerance:.1f}s, max_span: {max_span:.1f}s)"
-            if enable_auto
-            else f"disabled (default) (tolerance: {tolerance:.1f}s, max_span: {max_span:.1f}s)"
+            f"enabled (tolerance: {current[CONF_AUTO_ASSOCIATION_TOLERANCE_SECONDS]:.1f}s, "
+            f"max_span: {current[CONF_MAX_INCIDENT_SPAN_SECONDS]:.1f}s)"
+            if current[CONF_ENABLE_AUTO_ASSOCIATION]
+            else "disabled (default)"
         )
 
         description_placeholders = {
-            "media_root": str(resolved_media),
+            "media_root": self._resolved_media_root(),
             "precedence": "action > camera_profile > entry_defaults",
             "rate_estimate": "1.0 MiB/s (8 Mbps nominal stream)",
             "watchdog_formula": f"chunk_seconds + lookback_seconds + {DEFAULT_WATCHDOG_PADDING_SECONDS:.1f}s",
             "hard_cap_behavior": "stop (fail-closed, writers quarantined)",
-            "chunk_seconds": str(chunk_seconds),
-            "max_parallel": str(max_parallel),
-            "max_queue_depth": str(max_queue),
-            "queue_timeout": str(queue_timeout),
-            "retention_size_mb": str(retention_size),
-            "retention_days": str(retention_days),
-            "min_disk_free_mb": str(min_disk),
+            "chunk_seconds": str(current[CONF_CHUNK_SECONDS]),
+            "max_parallel": str(current[CONF_MAX_PARALLEL_RESOURCES]),
+            "max_queue_depth": str(current[CONF_MAX_QUEUE_DEPTH]),
+            "queue_timeout": str(current[CONF_QUEUE_WAIT_TIMEOUT_SECONDS]),
+            "retention_size_mb": str(current[CONF_RETENTION_SIZE_MB]),
+            "retention_days": str(current[CONF_RETENTION_DAYS]),
+            "min_disk_free_mb": str(current[CONF_MIN_DISK_FREE_MB]),
             "profiles_count": str(len(profiles)),
             "auto_association": auto_assoc_str,
         }
@@ -556,47 +607,26 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
             description_placeholders=description_placeholders,
         )
 
-    async def async_step_cameras(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Show camera profile actions."""
-        return self.async_show_menu(
-            step_id="cameras",
-            menu_options=["camera_add", "camera_edit", "camera_remove"],
-        )
-
     async def async_step_camera_add(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Choose a camera for the new profile."""
+        """Add a camera profile from a single form with grouped optional controls."""
         errors: dict[str, str] = {}
+        submitted: dict[str, Any] = {}
+        entity_id = ""
+
         if user_input is not None:
-            entity_id = str(user_input.get("camera_entity", ""))
+            submitted = _flatten_sections(user_input, _CAMERA_SECTION_IDS)
+            entity_id = str(submitted.get("camera_entity", "")).strip()
+            defaults = self._camera_add_defaults(entity_id)
+            attempt = dict(submitted)
+            # Omitted identity fields are derived from the selected camera entity.
+            if not str(attempt.get("source_id", "")).strip():
+                attempt["source_id"] = defaults["source_id"]
+            if not str(attempt.get("label", "")).strip():
+                attempt["label"] = defaults["label"]
+            profile = self._profile_from_input(attempt, defaults)
             errors.update(await self._validate_camera_entity(entity_id))
             if entity_id in self._profiles():
                 errors["camera_entity"] = "camera_profile_exists"
-            if not errors:
-                self._add_camera_entity = entity_id
-                return await self.async_step_camera_add_profile()
-
-        return self.async_show_form(
-            step_id="camera_add",
-            data_schema=self._camera_entity_schema(),
-            errors=errors,
-        )
-
-    async def async_step_camera_add_profile(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Set defaults for the selected camera."""
-        entity_id = getattr(self, "_add_camera_entity", None)
-        if not entity_id:
-            return self.async_abort(reason="camera_profile_missing")
-        defaults = default_camera_profile(
-            entity_id,
-            name=self._camera_name(entity_id),
-            chunk_seconds=self._global_chunk_seconds(),
-            max_window_seconds=self._global_max_window_seconds(),
-        )
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            profile = self._profile_from_input(user_input, defaults)
             errors.update(validate_camera_profile(entity_id, profile))
             if not errors:
                 profiles = self._profiles()
@@ -604,14 +634,46 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                     return self.async_abort(reason="camera_profile_missing")
                 profiles[entity_id] = profile
                 return self._save_profiles(profiles)
+
+        defaults = self._camera_add_defaults(entity_id)
+        displayed = {**defaults, **submitted}
+        if user_input is None:
+            displayed["source_id"] = ""
+            displayed["label"] = ""
+        else:
+            displayed["source_id"] = str(submitted.get("source_id", "") or "")
+            displayed["label"] = str(submitted.get("label", "") or "")
+        errors = self._finalize_camera_errors(errors)
+
         return self.async_show_form(
-            step_id="camera_add_profile",
+            step_id="camera_add",
             data_schema=self._profile_schema(
-                {**defaults, **(user_input or {})}, include_entity=False
+                displayed,
+                include_entity=True,
+                entity_default=entity_id or None,
+                expanded=_sections_with_errors(errors, _CAMERA_FIELD_SECTIONS),
             ),
             errors=errors,
-            description_placeholders={"camera_name": self._camera_name(entity_id)},
+            description_placeholders={
+                "camera_name": self._camera_name(entity_id) if entity_id else ""
+            },
         )
+
+    def _camera_add_defaults(self, entity_id: str) -> dict[str, Any]:
+        """Return profile defaults, using global timing settings for this camera."""
+        return default_camera_profile(
+            entity_id or "camera.",
+            name=self._camera_name(entity_id) if entity_id else None,
+            chunk_seconds=self._global_chunk_seconds(),
+            max_window_seconds=self._global_max_window_seconds(),
+        )
+
+    @staticmethod
+    def _finalize_camera_errors(errors: dict[str, str]) -> dict[str, str]:
+        """Keep profile errors visible even when they target a hidden field."""
+        if any(field not in _CAMERA_FORM_FIELDS for field in errors):
+            errors.setdefault("base", "invalid_profile")
+        return errors
 
     async def async_step_camera_edit(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Select an existing profile to edit."""
@@ -635,7 +697,7 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
     async def async_step_camera_edit_profile(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Edit one stored camera profile."""
+        """Edit one stored camera profile in a single form."""
         profiles = self._profiles()
         original_entity = getattr(self, "_edit_camera_entity", None)
         if original_entity not in profiles:
@@ -643,26 +705,40 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         old_profile = profiles[original_entity]
         current = {**default_camera_profile(original_entity), **old_profile}
         errors: dict[str, str] = {}
+        submitted: dict[str, Any] = {}
+        entity_default = original_entity
+
         if user_input is not None:
-            new_entity = str(user_input.get("camera_entity", original_entity))
-            errors.update(await self._validate_camera_entity(new_entity))
+            submitted = _flatten_sections(user_input, _CAMERA_SECTION_IDS)
+            new_entity = str(submitted.get("camera_entity", original_entity)).strip()
+            entity_default = new_entity or original_entity
+            errors.update(await self._validate_camera_entity(entity_default))
             if new_entity != original_entity and new_entity in profiles:
                 errors["camera_entity"] = "camera_profile_exists"
-            profile = self._profile_from_input(user_input, current)
-            errors.update(validate_camera_profile(new_entity, profile))
+            # Preserve stored keys that are not part of the form (hold/tail/unknown).
+            profile = self._profile_from_input(submitted, current, preserved=old_profile)
+            errors.update(validate_camera_profile(entity_default, profile))
             if not errors:
                 profiles.pop(original_entity)
-                profiles[new_entity] = profile
+                profiles[new_entity or original_entity] = profile
                 return self._save_profiles(profiles)
-        displayed = {**current, **(user_input or {})}
+            errors = self._finalize_camera_errors(errors)
+
+        displayed = {**current, **submitted}
+        # Never echo a stored or attempted credential back into the form.
+        displayed[CONF_FRIGATE_AUTH_TOKEN] = ""
         return self.async_show_form(
             step_id="camera_edit_profile",
             data_schema=self._profile_schema(
                 displayed,
                 include_entity=True,
-                entity_default=(user_input or {}).get("camera_entity", original_entity),
+                entity_default=entity_default,
+                expanded=_sections_with_errors(errors, _CAMERA_FIELD_SECTIONS),
             ),
             errors=errors,
+            description_placeholders={
+                "camera_name": self._camera_name(original_entity),
+            },
         )
 
     async def async_step_camera_remove(
@@ -740,19 +816,15 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         )
 
     @staticmethod
-    def _camera_entity_schema() -> Any:
-        return vol.Schema(
-            {
-                vol.Required("camera_entity"): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="camera")
-                )
-            }
-        )
-
-    @staticmethod
     def _profile_schema(
-        profile: dict[str, Any], *, include_entity: bool, entity_default: str | None = None
+        profile: dict[str, Any],
+        *,
+        include_entity: bool,
+        entity_default: str | None = None,
+        expanded: set[str] | None = None,
     ) -> Any:
+        """Build the single camera form with grouped optional/advanced fields."""
+        expanded = expanded or set()
         schema: dict[Any, Any] = {}
         if include_entity:
             entity_field = vol.Required("camera_entity")
@@ -773,8 +845,8 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
         ]
         schema.update(
             {
-                vol.Required("source_id", default=profile.get("source_id", "camera")): str,
-                vol.Required("label", default=profile.get("label", "Camera")): str,
+                vol.Optional("source_id", default=str(profile.get("source_id") or "")): str,
+                vol.Optional("label", default=str(profile.get("label") or "")): str,
                 vol.Required(
                     "recording_mode", default=profile.get("recording_mode", MODE_EXTEND)
                 ): selector.SelectSelector(
@@ -790,61 +862,94 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
                         options=provider_choices, mode=selector.SelectSelectorMode.DROPDOWN
                     )
                 ),
-                vol.Optional(
-                    "ownership_group", default=profile.get("ownership_group") or ""
-                ): str,
                 vol.Required(
-                    "window_seconds", default=profile.get("window_seconds", 15)
+                    "window_seconds",
+                    default=_form_number(profile.get("window_seconds"), 15),
                 ): number_spec_selector(SPEC_WINDOW_SECONDS),
                 vol.Required(
-                    "lookback_seconds", default=profile.get("lookback_seconds", 0)
-                ): number_spec_selector(SPEC_LOOKBACK_SECONDS),
-                vol.Required(
-                    "chunk_seconds", default=profile.get("chunk_seconds", 10)
-                ): number_spec_selector(SPEC_CHUNK_SECONDS),
-                vol.Required(
-                    "max_window_seconds", default=profile.get("max_window_seconds", 300)
+                    "max_window_seconds",
+                    default=_form_number(profile.get("max_window_seconds"), 300),
                 ): number_spec_selector(SPEC_MAX_WINDOW_SECONDS),
+            }
+        )
+
+        timing = vol.Schema(
+            {
                 vol.Optional(
-                    CONF_GO2RTC_STREAM, default=profile.get(CONF_GO2RTC_STREAM) or ""
+                    "lookback_seconds",
+                    default=_form_number(profile.get("lookback_seconds"), 0),
+                ): number_spec_selector(SPEC_LOOKBACK_SECONDS),
+                vol.Optional(
+                    "chunk_seconds", default=_form_number(profile.get("chunk_seconds"), 10)
+                ): number_spec_selector(SPEC_CHUNK_SECONDS),
+            }
+        )
+        provider = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_GO2RTC_STREAM, default=str(profile.get(CONF_GO2RTC_STREAM) or "")
                 ): str,
                 vol.Optional(
-                    CONF_FRIGATE_BASE_URL, default=profile.get(CONF_FRIGATE_BASE_URL) or ""
+                    CONF_FRIGATE_BASE_URL,
+                    default=str(profile.get(CONF_FRIGATE_BASE_URL) or ""),
                 ): str,
                 vol.Optional(
                     CONF_FRIGATE_CAMERA_NAME,
-                    default=profile.get(CONF_FRIGATE_CAMERA_NAME) or "",
+                    default=str(profile.get(CONF_FRIGATE_CAMERA_NAME) or ""),
                 ): str,
+                # Credentials are never prefilled; blank keeps the stored token.
+                vol.Optional(CONF_FRIGATE_AUTH_TOKEN, default=""): selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+                ),
                 vol.Optional(
-                    CONF_FRIGATE_AUTH_TOKEN, default=profile.get(CONF_FRIGATE_AUTH_TOKEN) or ""
-                ): str,
+                    "clear_frigate_auth_token", default=False
+                ): selector.BooleanSelector(),
                 vol.Optional(
                     CONF_EXPORT_DELAY_SECONDS,
                     default=profile.get(
                         CONF_EXPORT_DELAY_SECONDS, DEFAULT_EXPORT_DELAY_SECONDS
                     ),
                 ): number_spec_selector(SPEC_EXPORT_DELAY_SECONDS),
+            }
+        )
+        correlation = vol.Schema(
+            {
                 vol.Optional(
-                    "correlation_group", default=profile.get("correlation_group") or ""
+                    "ownership_group", default=str(profile.get("ownership_group") or "")
                 ): str,
                 vol.Optional(
-                    "zone", default=profile.get("zone") or ""
+                    "correlation_group", default=str(profile.get("correlation_group") or "")
                 ): str,
+                vol.Optional("zone", default=str(profile.get("zone") or "")): str,
                 vol.Optional(
                     "adjacent_zones",
                     default=", ".join(profile.get("adjacent_zones") or [])
                     if isinstance(profile.get("adjacent_zones"), (list, tuple))
-                    else (profile.get("adjacent_zones") or ""),
+                    else str(profile.get("adjacent_zones") or ""),
                 ): str,
                 vol.Optional(
                     "source_clock_offset_seconds",
-                    default=float(profile.get("source_clock_offset_seconds", 0.0)),
+                    default=_form_number(
+                        profile.get("source_clock_offset_seconds"), 0.0
+                    ),
                 ): number_spec_selector(SPEC_SOURCE_CLOCK_OFFSET_SECONDS, step=0.1),
                 vol.Optional(
                     "source_time_uncertainty_seconds",
-                    default=float(profile.get("source_time_uncertainty_seconds", 0.0)),
+                    default=_form_number(
+                        profile.get("source_time_uncertainty_seconds"), 0.0
+                    ),
                 ): number_spec_selector(SPEC_SOURCE_TIME_UNCERTAINTY_SECONDS, step=0.1),
             }
+        )
+
+        schema[vol.Required(SECTION_TIMING)] = data_entry_flow.section(
+            timing, {"collapsed": SECTION_TIMING not in expanded}
+        )
+        schema[vol.Required(SECTION_PROVIDER)] = data_entry_flow.section(
+            provider, {"collapsed": SECTION_PROVIDER not in expanded}
+        )
+        schema[vol.Required(SECTION_CORRELATION)] = data_entry_flow.section(
+            correlation, {"collapsed": SECTION_CORRELATION not in expanded}
         )
         return vol.Schema(schema)
 
@@ -870,22 +975,28 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
 
     @staticmethod
     def _profile_from_input(
-        user_input: dict[str, Any], defaults: dict[str, Any]
+        user_input: dict[str, Any],
+        defaults: dict[str, Any],
+        preserved: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        profile = {
-            key: user_input.get(key, defaults.get(key))
-            for key in (
-                "source_id",
-                "label",
-                "recording_mode",
-                "window_seconds",
-                "lookback_seconds",
-                "chunk_seconds",
-                "max_window_seconds",
-                CONF_RECORDING_PROVIDER,
-                CONF_GO2RTC_STREAM,
-            )
-        }
+        # Start from the stored profile so keys that are not on the form survive.
+        profile: dict[str, Any] = dict(preserved) if preserved else {}
+        profile.update(
+            {
+                key: user_input.get(key, defaults.get(key))
+                for key in (
+                    "source_id",
+                    "label",
+                    "recording_mode",
+                    "window_seconds",
+                    "lookback_seconds",
+                    "chunk_seconds",
+                    "max_window_seconds",
+                    CONF_RECORDING_PROVIDER,
+                    CONF_GO2RTC_STREAM,
+                )
+            }
+        )
         raw_group = user_input.get("ownership_group", defaults.get("ownership_group"))
         if isinstance(raw_group, str):
             stripped = raw_group.strip()
@@ -915,12 +1026,15 @@ class EventRecordingOptionsFlow(config_entries.OptionsFlow):
             raw_cam.strip() if isinstance(raw_cam, str) and raw_cam.strip() else None
         )
 
-        raw_token = user_input.get(
-            CONF_FRIGATE_AUTH_TOKEN, defaults.get(CONF_FRIGATE_AUTH_TOKEN)
-        )
-        profile[CONF_FRIGATE_AUTH_TOKEN] = (
-            raw_token.strip() if isinstance(raw_token, str) and raw_token.strip() else None
-        )
+        # Credentials: blank keeps the stored token, the clear flag removes it.
+        raw_token = user_input.get(CONF_FRIGATE_AUTH_TOKEN)
+        if bool(user_input.get("clear_frigate_auth_token", False)):
+            profile[CONF_FRIGATE_AUTH_TOKEN] = None
+        elif isinstance(raw_token, str) and raw_token.strip():
+            profile[CONF_FRIGATE_AUTH_TOKEN] = raw_token.strip()
+        else:
+            stored_token = defaults.get(CONF_FRIGATE_AUTH_TOKEN)
+            profile[CONF_FRIGATE_AUTH_TOKEN] = stored_token if stored_token else None
 
         export_delay = user_input.get(
             CONF_EXPORT_DELAY_SECONDS,
