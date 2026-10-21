@@ -25,29 +25,22 @@
   "options": {
     "step": {
       "init": {
-        "title": "Event Recording Options",
-        "description": "Manage all recording settings, camera profiles, and the effective configuration. Camera profiles are optional defaults; automations decide when to record.",
-        "menu_options": {
-          "settings": "Settings",
-          "camera_add": "Add Camera Profile",
-          "camera_edit": "Edit Camera Profile",
-          "camera_remove": "Remove Camera Profile",
-          "effective_config": "Configuration Summary (Read-only)"
-        }
-      },
-      "settings": {
         "title": "Event Recording Settings",
-        "description": "Recording, storage, connection, and association settings. Save applies all settings on this page.\n\nMedia root (fixed): {media_root}\nCurrent: {summary}",
+        "description": "All recording settings and camera profiles are edited on this page; Save applies them together.\n\nMedia root (read-only): {media_root}\nCurrent: {summary}\n\n{camera_profile_error}",
         "data": {
           "chunk_seconds": "Recording Chunk Duration (seconds, max 15)",
           "retention_size_mb": "Maximum Storage Budget (MB, min 50)",
           "retention_days": "Retention Duration (Days, min 1)",
-          "min_disk_free_mb": "Minimum Free Disk Space (MB, floor 50)"
+          "min_disk_free_mb": "Minimum Free Disk Space (MB, floor 50)",
+          "camera_profiles": "Camera Profiles (optional)",
+          "confirm_camera_removals": "I confirm removing these camera profiles"
         },
         "data_description": {
           "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments.",
           "retention_size_mb": "Recordings are pruned when the storage budget is reached.",
-          "min_disk_free_mb": "Recording admission fails when free disk space would drop below this floor."
+          "min_disk_free_mb": "Recording admission fails when free disk space would drop below this floor.",
+          "camera_profiles": "Each row is identified by its camera entity; use Add, Edit, and Delete in the list. Source ID and display name are inferred for new cameras; leaving the Frigate token blank keeps the saved token for that same camera. Changing a row's camera entity replaces that profile: the previous camera's token and extra settings are not carried over, and its removal is confirmed on Save.",
+          "confirm_camera_removals": "Tick to confirm removing the camera profiles no longer listed above, then Save again. Recordings and journal events are never deleted."
         },
         "sections": {
           "connection": {
@@ -88,176 +81,16 @@
             }
           }
         }
-      },
-      "camera_add": {
-        "title": "Add Camera Profile",
-        "description": "Add a camera profile in one step. Leave Source ID and Display Name blank to derive them from the selected camera entity. Timing, provider, and correlation controls are grouped below.",
-        "data": {
-          "camera_entity": "Camera",
-          "source_id": "Source ID (optional)",
-          "label": "Display Name (optional)",
-          "recording_mode": "Recording Capture Mode",
-          "recording_provider": "Recording Provider",
-          "window_seconds": "Default Recording Window (seconds)",
-          "max_window_seconds": "Maximum Recording Window (seconds)"
-        },
-        "data_description": {
-          "source_id": "Stable identifier used to group this camera's events in the timeline. Derived from the camera entity when left blank.",
-          "label": "Name shown in the timeline. Derived from the camera entity when left blank.",
-          "recording_mode": "Capture lifecycle: extend (repeated bounded chunks), native_fixed (one clip), native_snapshot (still image), or buffered (Frigate export). go2rtc supports extend and native_fixed only.",
-          "recording_provider": "Home Assistant is the default. go2rtc buffers video-only fMP4 fragments for pre-event capture.",
-          "window_seconds": "The default duration requested when an automation records this camera.",
-          "max_window_seconds": "Longest recording window allowed for this camera."
-        },
-        "sections": {
-          "timing": {
-            "name": "Timing",
-            "data": {
-              "lookback_seconds": "Lookback (seconds)",
-              "chunk_seconds": "Recording Chunk Duration (seconds)"
-            },
-            "data_description": {
-              "lookback_seconds": "Best-effort pre-event capture. Cold streams may have no pre-roll.",
-              "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments."
-            }
-          },
-          "provider": {
-            "name": "Provider Options",
-            "data": {
-              "go2rtc_stream": "go2rtc Stream Alias",
-              "frigate_base_url": "Frigate NVR Base URL (Buffered mode)",
-              "frigate_camera_name": "Frigate Camera Name",
-              "frigate_auth_token": "Frigate API Token (optional, leave blank to keep saved token)",
-              "clear_frigate_auth_token": "Clear saved Frigate token",
-              "export_delay_seconds": "Post-Trigger Export Delay (seconds)"
-            },
-            "data_description": {
-              "go2rtc_stream": "Named stream alias configured in go2rtc. Required when the recording provider is go2rtc.",
-              "frigate_base_url": "HTTP or HTTPS base URL of Frigate NVR (for example http://frigate.local:5000).",
-              "frigate_camera_name": "Camera identifier defined in Frigate configuration.",
-              "frigate_auth_token": "The saved token is never shown. Leave blank to keep it, or tick the clear box to remove it.",
-              "export_delay_seconds": "Seconds to wait after event end before requesting the exported clip."
-            }
-          },
-          "correlation": {
-            "name": "Correlation & Clocks",
-            "data": {
-              "ownership_group": "Stream Ownership Group (Optional)",
-              "correlation_group": "Correlation Group (Optional)",
-              "zone": "Physical Zone (Optional)",
-              "adjacent_zones": "Adjacent Zones (Optional, comma-separated)",
-              "source_clock_offset_seconds": "Source Clock Offset (seconds, -3600 to 3600)",
-              "source_time_uncertainty_seconds": "Source Time Uncertainty (seconds, 0 to 300)"
-            },
-            "data_description": {
-              "ownership_group": "Optional group identifier for cameras sharing the same physical stream to prevent parallel stream concurrency.",
-              "correlation_group": "Groups related cameras for cross-camera association.",
-              "adjacent_zones": "Comma-separated zones next to this camera, used for cross-camera hypotheses."
-            }
-          }
-        }
-      },
-      "camera_edit": {
-        "title": "Choose Camera Profile to Edit",
-        "data": {
-          "camera_entity": "Camera Profile"
-        },
-        "description": ""
-      },
-      "camera_edit_profile": {
-        "title": "Edit Camera Profile",
-        "description": "Editing {camera_name}. Leave the Frigate token blank to keep the saved token. Timing, provider, and correlation controls are grouped below.",
-        "data": {
-          "camera_entity": "Camera",
-          "source_id": "Source ID",
-          "label": "Display Name",
-          "recording_mode": "Recording Capture Mode",
-          "recording_provider": "Recording Provider",
-          "window_seconds": "Default Recording Window (seconds)",
-          "max_window_seconds": "Maximum Recording Window (seconds)"
-        },
-        "data_description": {
-          "source_id": "Stable identifier used to group this camera's events in the timeline.",
-          "label": "Name shown in the timeline.",
-          "recording_mode": "Capture lifecycle: extend (repeated bounded chunks), native_fixed (one clip), native_snapshot (still image), or buffered (Frigate export). go2rtc supports extend and native_fixed only.",
-          "recording_provider": "Home Assistant is the default. go2rtc buffers video-only fMP4 fragments for pre-event capture.",
-          "window_seconds": "The default duration requested when an automation records this camera.",
-          "max_window_seconds": "Longest recording window allowed for this camera."
-        },
-        "sections": {
-          "timing": {
-            "name": "Timing",
-            "data": {
-              "lookback_seconds": "Lookback (seconds)",
-              "chunk_seconds": "Recording Chunk Duration (seconds)"
-            },
-            "data_description": {
-              "lookback_seconds": "Best-effort pre-event capture. Cold streams may have no pre-roll.",
-              "chunk_seconds": "Maximum length of each recording segment; longer windows use multiple segments."
-            }
-          },
-          "provider": {
-            "name": "Provider Options",
-            "data": {
-              "go2rtc_stream": "go2rtc Stream Alias",
-              "frigate_base_url": "Frigate NVR Base URL (Buffered mode)",
-              "frigate_camera_name": "Frigate Camera Name",
-              "frigate_auth_token": "Frigate API Token (optional, leave blank to keep saved token)",
-              "clear_frigate_auth_token": "Clear saved Frigate token",
-              "export_delay_seconds": "Post-Trigger Export Delay (seconds)"
-            },
-            "data_description": {
-              "go2rtc_stream": "Named stream alias configured in go2rtc. Required when the recording provider is go2rtc.",
-              "frigate_base_url": "HTTP or HTTPS base URL of Frigate NVR (for example http://frigate.local:5000).",
-              "frigate_camera_name": "Camera identifier defined in Frigate configuration.",
-              "frigate_auth_token": "The saved token is never shown. Leave blank to keep it, or tick the clear box to remove it.",
-              "export_delay_seconds": "Seconds to wait after event end before requesting the exported clip."
-            }
-          },
-          "correlation": {
-            "name": "Correlation & Clocks",
-            "data": {
-              "ownership_group": "Stream Ownership Group (Optional)",
-              "correlation_group": "Correlation Group (Optional)",
-              "zone": "Physical Zone (Optional)",
-              "adjacent_zones": "Adjacent Zones (Optional, comma-separated)",
-              "source_clock_offset_seconds": "Source Clock Offset (seconds, -3600 to 3600)",
-              "source_time_uncertainty_seconds": "Source Time Uncertainty (seconds, 0 to 300)"
-            },
-            "data_description": {
-              "ownership_group": "Optional group identifier for cameras sharing the same physical stream to prevent parallel stream concurrency.",
-              "correlation_group": "Groups related cameras for cross-camera association.",
-              "adjacent_zones": "Comma-separated zones next to this camera, used for cross-camera hypotheses."
-            }
-          }
-        }
-      },
-      "camera_remove": {
-        "title": "Choose Camera Profile to Remove",
-        "data": {
-          "camera_entity": "Camera Profile"
-        },
-        "description": ""
-      },
-      "camera_remove_confirm": {
-        "title": "Remove Camera Profile",
-        "description": "Remove the profile for {camera_name} ({camera_entity})? Existing journal events and recordings will be kept.",
-        "data": {
-          "confirm": "Remove this camera profile"
-        }
-      },
-      "effective_config": {
-        "title": "Effective Configuration Summary",
-        "description": "Current effective settings:\n\n- Storage Root (fixed): {media_root}\n- Precedence: {precedence}\n- Estimated Byte Rate: {rate_estimate}\n- Chunk Duration: {chunk_seconds}s\n- Concurrency: {max_parallel}\n- Queue: {max_queue_depth} (timeout: {queue_timeout}s)\n- Retention: {retention_size_mb} MB / {retention_days} days\n- Disk Free Floor: {min_disk_free_mb} MB\n- Camera Profiles: {profiles_count}\n- Auto-Association: {auto_association}\n\nWatchdog Timeout: {watchdog_formula}; hard cap safeguard: {hard_cap_behavior}.\n\nClose this summary to leave settings unchanged."
       }
     },
     "error": {
       "invalid_camera_entity": "Choose a Home Assistant camera entity.",
       "camera_entity_not_found": "Choose a camera entity that exists in Home Assistant.",
-      "camera_profile_exists": "A profile already exists for this camera.",
-      "camera_profile_missing": "That camera profile no longer exists. Open the camera actions and try again.",
-      "no_camera_profiles": "There are no camera profiles to edit or remove.",
-      "invalid_profile": "Some camera settings are invalid. Review the expanded sections.",
+      "camera_profile_exists": "This camera is already listed.",
+      "invalid_camera_profile": "One or more camera profiles are invalid. Review the details shown above the camera list.",
+      "invalid_camera_profiles": "The camera profile list could not be read. Reload the page and try again.",
+      "too_many_camera_profiles": "Too many camera profiles were submitted. Save fewer rows at once.",
+      "camera_removal_requires_confirmation": "Removing a camera profile requires confirmation.",
       "invalid_source_id": "Enter a source ID of 1 to 128 characters.",
       "invalid_label": "Enter a display name of 1 to 256 characters.",
       "invalid_window_seconds": "Recording window must be a whole number from 1 to 300 seconds.",
@@ -289,11 +122,6 @@
       "invalid_export_delay_seconds": "Export delay must be a whole number from 0 to 60 seconds.",
       "invalid_go2rtc_base_url": "Enter an HTTP or HTTPS base URL without credentials, query, or fragment.",
       "go2rtc_credentials_incomplete": "Enter both a username and password, or clear the saved password."
-    },
-    "abort": {
-      "remove_cancelled": "Camera profile removal was cancelled.",
-      "camera_profile_missing": "That camera profile no longer exists.",
-      "no_camera_profiles": "There are no camera profiles to edit or remove."
     }
   }
 }
