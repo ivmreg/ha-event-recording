@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..models import (
+    AbandonedCaptureCandidate,
+    CaptureFinishResult,
     RecordedEvent,
     RecordingIntent,
     ResourceSession,
@@ -30,6 +32,10 @@ from ..models import (
 from .common import JournalStoreBase
 
 _LOGGER = logging.getLogger(__name__)
+
+_TERMINAL_CAPTURE_STATES = frozenset(
+    {"ready", "partial", "failed", "interrupted", "expired"}
+)
 
 
 class SessionsMixin(JournalStoreBase):
@@ -735,6 +741,9 @@ class SessionsMixin(JournalStoreBase):
                     """DELETE FROM recording_intents WHERE intent_id IN (
                     SELECT intent_id FROM recording_intents
                     WHERE status IN ('completed', 'failed', 'cancelled') AND updated_at < ?
+                    AND NOT EXISTS (SELECT 1 FROM events e
+                        WHERE e.event_id = recording_intents.event_id
+                        AND e.capture_state IN ('requested', 'recording'))
                     ORDER BY updated_at LIMIT ?
                 );""",
                     (cutoff, limit),
@@ -787,6 +796,24 @@ class SessionsMixin(JournalStoreBase):
         """Get the current session state for a physical resource key."""
         return await asyncio.to_thread(self._sync_get_resource_session, resource_key)
 
+    def _hydrate_resource_session(self, row: Any) -> ResourceSession:
+        return ResourceSession(
+            resource_key=row["resource_key"],
+            active_event_id=row["active_event_id"],
+            last_activity_at=ensure_utc(row["last_activity_at"]),
+            desired_capture_end=ensure_utc(row["desired_capture_end"]),
+            hold=bool(row["hold"]),
+            tail_window_seconds=row["tail_window_seconds"],
+            recorder_config=json.loads(row["recorder_config_json"])
+            if row.get("recorder_config_json")
+            else {},
+            access_entities=tuple(json.loads(row["access_entities_json"]))
+            if row.get("access_entities_json")
+            else (),
+            owner_user_id=row.get("owner_user_id"),
+            updated_at=ensure_utc(row["updated_at"]),
+        )
+
     def _sync_get_resource_session(self, resource_key: str) -> ResourceSession | None:
         with self._lock:
             assert self._conn is not None
@@ -795,22 +822,373 @@ class SessionsMixin(JournalStoreBase):
             row = cur.fetchone()
             if not row:
                 return None
-            return ResourceSession(
-                resource_key=row["resource_key"],
-                active_event_id=row["active_event_id"],
-                last_activity_at=ensure_utc(row["last_activity_at"]),
-                desired_capture_end=ensure_utc(row["desired_capture_end"]),
-                hold=bool(row["hold"]),
-                tail_window_seconds=row["tail_window_seconds"],
-                recorder_config=json.loads(row["recorder_config_json"])
-                if row.get("recorder_config_json")
-                else {},
-                access_entities=tuple(json.loads(row["access_entities_json"]))
-                if row.get("access_entities_json")
-                else (),
-                owner_user_id=row.get("owner_user_id"),
-                updated_at=ensure_utc(row["updated_at"]),
+            return self._hydrate_resource_session(row)
+
+    async def finish_capture_if_current(
+        self,
+        resource_key: str,
+        event_id: str,
+        valid_clips_count: int,
+        error: str | None,
+        reason: str,
+        now: datetime,
+        *,
+        allow_extension: bool = False,
+        final_state: str | None = None,
+    ) -> CaptureFinishResult:
+        """Atomically finalize an event only while it still owns its resource.
+
+        The ownership check, current-window/hold check, and terminal transition
+        share one ``BEGIN IMMEDIATE`` transaction.  If a newer admission already
+        extended the window, ``extended`` is returned without touching the
+        event; the caller can resume in place.  If another event owns the
+        resource, ``replaced`` is returned and neither event/session is mutated.
+        """
+
+        def finish() -> tuple[CaptureFinishResult, tuple[str, int] | None]:
+            return self._sync_finish_capture_if_current(
+                resource_key,
+                event_id,
+                valid_clips_count,
+                error,
+                reason,
+                now,
+                allow_extension,
+                final_state,
             )
+
+        result, notify_tuple = await asyncio.to_thread(finish)
+        if notify_tuple:
+            self._notify_subscribers(*notify_tuple)
+        return result
+
+    def _sync_finish_capture_if_current(
+        self,
+        resource_key: str,
+        event_id: str,
+        valid_clips_count: int,
+        error: str | None,
+        reason: str,
+        now: datetime,
+        allow_extension: bool,
+        final_state: str | None,
+    ) -> tuple[CaptureFinishResult, tuple[str, int] | None]:
+        if valid_clips_count < 0:
+            raise ValueError("valid_clips_count must be non-negative")
+        if final_state is not None:
+            if final_state not in _TERMINAL_CAPTURE_STATES:
+                raise ValueError(
+                    f"final_state override must be terminal, got {final_state!r}"
+                )
+            if valid_clips_count == 0 and final_state in ("ready", "partial"):
+                raise ValueError(
+                    f"zero valid clips cannot be finalized as {final_state!r}"
+                )
+
+        decision_now = ensure_utc(now)
+        now_dt = utc_now()
+        now_str = format_iso(now_dt) or ""
+
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute(
+                    "SELECT * FROM resource_sessions WHERE resource_key = ?;",
+                    (resource_key,),
+                )
+                session_row = cur.fetchone()
+                session = (
+                    self._hydrate_resource_session(session_row) if session_row else None
+                )
+                owns_session = (
+                    session is not None and session.active_event_id == event_id
+                )
+                if (
+                    session is not None
+                    and session.active_event_id is not None
+                    and not owns_session
+                ):
+                    cur.execute("COMMIT;")
+                    return CaptureFinishResult(status="replaced", session=session), None
+
+                cur.execute("SELECT * FROM events WHERE event_id = ?;", (event_id,))
+                event_row = cur.fetchone()
+                if event_row is None:
+                    cur.execute("COMMIT;")
+                    return CaptureFinishResult(status="replaced", session=session), None
+
+                event = getattr(self, "_sync_hydrate_event")(cur, event_row)
+                if event.capture_state in _TERMINAL_CAPTURE_STATES:
+                    cur.execute("COMMIT;")
+                    return (
+                        CaptureFinishResult(
+                            status="terminal", event=event, session=session
+                        ),
+                        None,
+                    )
+
+                if not owns_session:
+                    # The session was cleared without a replacement, or belongs
+                    # to a newer event; do not mutate this stale event.
+                    cur.execute("COMMIT;")
+                    return CaptureFinishResult(status="replaced", session=session), None
+
+                if allow_extension and (
+                    session.hold or session.desired_capture_end > decision_now
+                ):
+                    _LOGGER.debug(
+                        "Capture for %s still owns an open window during %s; "
+                        "resuming instead of finalizing event %s",
+                        resource_key,
+                        reason,
+                        event_id,
+                    )
+                    cur.execute("COMMIT;")
+                    return (
+                        CaptureFinishResult(
+                            status="extended", event=event, session=session
+                        ),
+                        None,
+                    )
+
+                if final_state is not None:
+                    state = final_state
+                    if (
+                        valid_clips_count == 0
+                        and final_state == "failed"
+                        and error is None
+                    ):
+                        error_code = "ZERO_CLIPS_RECORDED"
+                    else:
+                        error_code = error
+                elif valid_clips_count == 0:
+                    state = "failed"
+                    error_code = error or "ZERO_CLIPS_RECORDED"
+                elif error:
+                    state = "partial"
+                    error_code = error
+                else:
+                    state = "ready"
+                    error_code = None
+
+                updated, notify_tuple = self._sync_apply_capture_state(
+                    cur, event_id, state, error_code, now_str
+                )
+                cur.execute("COMMIT;")
+                return (
+                    CaptureFinishResult(status="finished", event=updated),
+                    notify_tuple,
+                )
+            except Exception:
+                cur.execute("ROLLBACK;")
+                raise
+
+    async def find_abandoned_capture_candidates(
+        self,
+        *,
+        older_than: datetime,
+        limit: int = 8,
+        after_updated_at: datetime | None = None,
+        after_event_id: str | None = None,
+    ) -> list[AbandonedCaptureCandidate]:
+        """Return a bounded, keyset-rotated page of ownerless inflight events.
+
+        The query starts from ``events.capture_state`` (covered by
+        ``idx_events_capture_state``) rather than from ``resource_sessions``:
+        an abandoned event may already have had its session binding cleared or
+        replaced.  Physical resource identity is resolved from the latest
+        durable start/extend intent (covered by ``idx_intents_event``), never
+        guessed from ``source_id``.
+
+        ``after_updated_at``/``after_event_id`` form a stable cursor so live or
+        unrepairable older rows cannot occupy the first page forever.
+        """
+        bounded_limit = max(1, min(64, int(limit)))
+        return await asyncio.to_thread(
+            self._sync_find_abandoned_capture_candidates,
+            older_than,
+            bounded_limit,
+            after_updated_at,
+            after_event_id,
+        )
+
+    def _sync_find_abandoned_capture_candidates(
+        self,
+        older_than: datetime,
+        limit: int,
+        after_updated_at: datetime | None,
+        after_event_id: str | None,
+    ) -> list[AbandonedCaptureCandidate]:
+        threshold = format_iso(ensure_utc(older_than)) or ""
+        cursor_clause = ""
+        params: list[Any] = [threshold]
+        if after_updated_at is not None and after_event_id:
+            after_str = format_iso(ensure_utc(after_updated_at)) or ""
+            cursor_clause = (
+                "AND (e.updated_at > ? OR "
+                "(e.updated_at = ? AND e.event_id > ?))"
+            )
+            params.extend([after_str, after_str, after_event_id])
+        params.append(limit)
+
+        candidates: list[AbandonedCaptureCandidate] = []
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.cursor()
+            cur.execute(
+                f"""
+                SELECT e.event_id, e.capture_state, e.updated_at
+                FROM events e
+                WHERE e.capture_state IN ('requested', 'recording')
+                  AND e.updated_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM recording_intents ri
+                      WHERE ri.event_id = e.event_id
+                        AND ri.status IN ('pending', 'leased')
+                  )
+                  {cursor_clause}
+                ORDER BY e.updated_at ASC, e.event_id ASC
+                LIMIT ?;
+                """,
+                tuple(params),
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                cur.execute(
+                    """
+                    SELECT resource_key, recorder_config_json
+                    FROM recording_intents
+                    WHERE event_id = ? AND operation = 'start_or_extend'
+                    ORDER BY created_at DESC
+                    LIMIT 1;
+                    """,
+                    (row["event_id"],),
+                )
+                identity = cur.fetchone()
+                if identity is None:
+                    # Fallback for a still-bound session when older intent
+                    # records were compacted.  A cleared session plus missing
+                    # intent has no safe physical identity.
+                    cur.execute(
+                        """
+                        SELECT resource_key, recorder_config_json
+                        FROM resource_sessions
+                        WHERE active_event_id = ?
+                        LIMIT 1;
+                        """,
+                        (row["event_id"],),
+                    )
+                    identity = cur.fetchone()
+                if identity is None:
+                    candidates.append(
+                        AbandonedCaptureCandidate(
+                            event_id=row["event_id"],
+                            resource_key=None,
+                            capture_state=row["capture_state"],
+                            updated_at=ensure_utc(row["updated_at"]),
+                            missing_identity=True,
+                        )
+                    )
+                    continue
+                try:
+                    config = (
+                        json.loads(identity["recorder_config_json"])
+                        if identity.get("recorder_config_json")
+                        else {}
+                    )
+                except (TypeError, ValueError):
+                    config = {}
+                config = config if isinstance(config, dict) else {}
+                profile = config.get("_event_recording_profile") or {}
+                profile = profile if isinstance(profile, dict) else {}
+                ownership_group = profile.get("ownership_group") or config.get(
+                    "ownership_group"
+                )
+                candidates.append(
+                    AbandonedCaptureCandidate(
+                        event_id=row["event_id"],
+                        resource_key=identity["resource_key"],
+                        ownership_group=ownership_group,
+                        capture_state=row["capture_state"],
+                        updated_at=ensure_utc(row["updated_at"]),
+                    )
+                )
+        return candidates
+
+    async def settle_abandoned_capture(
+        self, *, event_id: str, resource_key: str, error_code: str, now: datetime,
+    ) -> CaptureFinishResult:
+        """Settle a physically stopped owner, counting durable media atomically.
+
+        The caller holds the runtime dispatch fence and verifies writer settlement.
+        This transaction rechecks intents, identity and state, and clears only
+        sessions still bound to this exact event, never a successor's session.
+        """
+        result, notification = await asyncio.to_thread(
+            self._sync_settle_abandoned_capture,
+            event_id, resource_key, error_code, ensure_utc(now),
+        )
+        if notification:
+            self._notify_subscribers(*notification)
+        return result
+
+    def _sync_settle_abandoned_capture(
+        self, event_id: str, resource_key: str, error_code: str, now: datetime,
+    ) -> tuple[CaptureFinishResult, tuple[str, int] | None]:
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute("SELECT * FROM events WHERE event_id = ?;", (event_id,))
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute("COMMIT;")
+                    return CaptureFinishResult(status="replaced"), None
+                event = getattr(self, "_sync_hydrate_event")(cur, row)
+                if event.capture_state in _TERMINAL_CAPTURE_STATES:
+                    cur.execute("COMMIT;")
+                    return CaptureFinishResult(status="terminal", event=event), None
+                cur.execute(
+                    "SELECT 1 FROM recording_intents WHERE event_id = ? "
+                    "AND status IN ('pending', 'leased') LIMIT 1;", (event_id,),
+                )
+                if cur.fetchone() is not None:
+                    cur.execute("COMMIT;")
+                    return CaptureFinishResult(status="extended", event=event), None
+                cur.execute(
+                    "SELECT 1 FROM resource_sessions WHERE resource_key = ? "
+                    "AND active_event_id = ? UNION ALL "
+                    "SELECT 1 FROM recording_intents WHERE resource_key = ? "
+                    "AND event_id = ? AND operation = 'start_or_extend' LIMIT 1;",
+                    (resource_key, event_id, resource_key, event_id),
+                )
+                if cur.fetchone() is None:
+                    cur.execute("COMMIT;")
+                    return CaptureFinishResult(status="replaced"), None
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM media WHERE event_id = ? AND available = 1;",
+                    (event_id,),
+                )
+                has_media = cur.fetchone()["n"] > 0
+                if has_media:
+                    coverage = json.loads(row["coverage_json"] or "{}")
+                    coverage["is_uncertain"] = True
+                    cur.execute(
+                        "UPDATE events SET coverage_json = ? WHERE event_id = ?;",
+                        (json.dumps(coverage), event_id),
+                    )
+                updated, notification = self._sync_apply_capture_state(
+                    cur, event_id, "partial" if has_media else "interrupted",
+                    error_code, format_iso(now) or "",
+                )
+                cur.execute("COMMIT;")
+                return CaptureFinishResult(status="finished", event=updated), notification
+            except Exception:
+                cur.execute("ROLLBACK;")
+                raise
 
     async def clear_resource_session(self, resource_key: str) -> None:
         """Clear active event binding for a resource session off-loop."""
@@ -840,6 +1218,76 @@ class SessionsMixin(JournalStoreBase):
             self._notify_subscribers(*notify_tuple)
         return ev
 
+    def _sync_apply_capture_state(
+        self,
+        cur: Any,
+        event_id: str,
+        state: str,
+        error_code: str | None,
+        now_str: str,
+    ) -> tuple[RecordedEvent, tuple[str, int] | None]:
+        sanitized_error = sanitize_capture_error(error_code)
+
+        cur.execute("SELECT * FROM events WHERE event_id = ?;", (event_id,))
+        row = cur.fetchone()
+        if not row:
+            raise KeyError(f"Event {event_id} not found")
+
+        current_state = row["capture_state"]
+        current_error = row.get("capture_error")
+
+        existing_coverage = json.loads(row["coverage_json"]) if row["coverage_json"] else {}
+        if state == "ready" and (
+            existing_coverage.get("is_uncertain") or current_state == "partial"
+        ):
+            state = "partial"
+
+        state_changed = state != current_state
+        error_changed = sanitized_error != current_error
+
+        if not state_changed and not error_changed:
+            return getattr(self, "_sync_hydrate_event")(cur, row), None
+
+        was_final = current_state in ("ready", "partial")
+        is_final = state in ("ready", "partial")
+        is_first_finalization = is_final and not was_final
+
+        new_media_rev = (
+            row["media_revision"] + 1 if is_first_finalization else row["media_revision"]
+        )
+        new_rev = row["revision"] + 1
+
+        end_at_str = row["end_at"] or (
+            now_str if state in ("ready", "partial", "failed", "interrupted", "expired") else None
+        )
+
+        cur.execute(
+            """
+            UPDATE events
+            SET capture_state = ?, capture_error = ?, end_at = ?, media_revision = ?, revision = ?, updated_at = ?
+            WHERE event_id = ?;
+            """,
+            (
+                state,
+                sanitized_error,
+                end_at_str,
+                new_media_rev,
+                new_rev,
+                now_str,
+                event_id,
+            ),
+        )
+
+        if state in ("ready", "partial", "failed", "interrupted", "expired"):
+            cur.execute(
+                "UPDATE resource_sessions SET active_event_id = NULL WHERE active_event_id = ?;",
+                (event_id,),
+            )
+
+        cur.execute("SELECT * FROM events WHERE event_id = ?;", (event_id,))
+        ev = getattr(self, "_sync_hydrate_event")(cur, cur.fetchone())
+        return ev, (event_id, ev.revision)
+
     def _sync_update_capture_state(
         self,
         event_id: str,
@@ -848,79 +1296,20 @@ class SessionsMixin(JournalStoreBase):
     ) -> tuple[RecordedEvent, tuple[str, int] | None]:
         now_dt = utc_now()
         now_str = format_iso(now_dt) or ""
-        sanitized_error = sanitize_capture_error(error_code)
 
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("SELECT * FROM events WHERE event_id = ?;", (event_id,))
-            row = cur.fetchone()
-            if not row:
-                raise KeyError(f"Event {event_id} not found")
-
-            current_state = row["capture_state"]
-            current_error = row.get("capture_error")
-
-            existing_coverage = json.loads(row["coverage_json"]) if row["coverage_json"] else {}
-            if state == "ready" and (
-                existing_coverage.get("is_uncertain") or current_state == "partial"
-            ):
-                state = "partial"
-
-            state_changed = state != current_state
-            error_changed = sanitized_error != current_error
-
-            if not state_changed and not error_changed:
-                return getattr(self, "_sync_hydrate_event")(cur, row), None
-
             cur.execute("BEGIN IMMEDIATE;")
             try:
-                was_final = current_state in ("ready", "partial")
-                is_final = state in ("ready", "partial")
-                is_first_finalization = is_final and not was_final
-
-                new_media_rev = (
-                    row["media_revision"] + 1 if is_first_finalization else row["media_revision"]
+                ev, notify_tuple = self._sync_apply_capture_state(
+                    cur, event_id, state, error_code, now_str
                 )
-                new_rev = row["revision"] + 1
-
-                end_at_str = row["end_at"] or (
-                    now_str
-                    if state in ("ready", "partial", "failed", "interrupted", "expired")
-                    else None
-                )
-
-                cur.execute(
-                    """
-                    UPDATE events
-                    SET capture_state = ?, capture_error = ?, end_at = ?, media_revision = ?, revision = ?, updated_at = ?
-                    WHERE event_id = ?;
-                    """,
-                    (
-                        state,
-                        sanitized_error,
-                        end_at_str,
-                        new_media_rev,
-                        new_rev,
-                        now_str,
-                        event_id,
-                    ),
-                )
-
-                if state in ("ready", "partial", "failed", "interrupted", "expired"):
-                    cur.execute(
-                        "UPDATE resource_sessions SET active_event_id = NULL WHERE active_event_id = ?;",
-                        (event_id,),
-                    )
-
                 cur.execute("COMMIT;")
+                return ev, notify_tuple
             except Exception:
                 cur.execute("ROLLBACK;")
                 raise
-
-            cur.execute("SELECT * FROM events WHERE event_id = ?;", (event_id,))
-            ev = getattr(self, "_sync_hydrate_event")(cur, cur.fetchone())
-            return ev, (event_id, ev.revision)
 
     async def finalize_event(self, event_id: str) -> RecordedEvent:
         """Mark event capture ready idempotently."""

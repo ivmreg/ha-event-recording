@@ -36,7 +36,12 @@ from .const import (
     TIME_QUALITY_PROVIDER_REPORTED,
     TIME_QUALITY_UNKNOWN,
 )
-from .core.models import RecordedEvent, ResourceSession, sanitize_capture_error
+from .core.models import (
+    CaptureFinishResult,
+    RecordedEvent,
+    ResourceSession,
+    sanitize_capture_error,
+)
 from .core.storage_ledger import StorageCapacityError
 from .core.store import JournalStore
 from .recorder import (
@@ -76,6 +81,8 @@ class CaptureContext(Protocol):
 
     def now(self) -> datetime: ...
 
+    async def request_resource_reschedule(self, resource_key: str) -> None: ...
+
 
 class CaptureExecutor:
     """Coordinates capture task execution, slot semaphore acquisition, and adapter dispatch."""
@@ -108,15 +115,48 @@ class CaptureExecutor:
         return self.coordinator.slot_manager
 
     async def finish_capture(
-        self, event_id: str, valid_clips_count: int, error: str | None
-    ) -> None:
-        """Conclude capture state adhering strictly to invariant: zero clips CANNOT be ready."""
+        self,
+        event_id: str,
+        valid_clips_count: int,
+        error: str | None,
+        *,
+        resource_key: str | None = None,
+        reason: str = "completion",
+        allow_extension: bool = False,
+        final_state: str | None = None,
+        now: datetime | None = None,
+    ) -> CaptureFinishResult | None:
+        """Conclude capture state adhering strictly to invariant: zero clips CANNOT be ready.
+
+        When ``resource_key`` is supplied the terminal transition is conditional
+        on the event still owning that resource.  A still-open window or hold is
+        reported as ``extended`` so the caller can resume in place without
+        resetting first-chunk/preroll or hard-cap state.
+        """
         _LOGGER.debug(
-            "Finishing capture for event %s: valid_clips=%d, error=%s",
+            "Finishing capture for event %s: valid_clips=%d, error=%s, reason=%s, resource=%s",
             event_id,
             valid_clips_count,
             error,
+            reason,
+            resource_key,
         )
+        if resource_key is not None:
+            result = await self.store.finish_capture_if_current(
+                resource_key=resource_key,
+                event_id=event_id,
+                valid_clips_count=valid_clips_count,
+                error=error,
+                reason=reason,
+                now=now or self.coordinator.now(),
+                allow_extension=allow_extension,
+                final_state=final_state,
+            )
+            _LOGGER.debug(
+                "Conditional finish for event %s: status=%s", event_id, result.status
+            )
+            return result
+
         if valid_clips_count == 0:
             terminal_error = error or "ZERO_CLIPS_RECORDED"
             await self.store.update_capture_state(event_id, "failed", error_code=terminal_error)
@@ -124,21 +164,42 @@ class CaptureExecutor:
             await self.store.update_capture_state(event_id, "partial", error_code=error)
         else:
             await self.store.finalize_event(event_id)
+        return None
 
-    async def run_resource_capture(self, resource_key: str) -> None:
-        """Serialize capture for a specific resource under dynamic slot concurrency."""
+    async def _finish_before_capture(
+        self, resource_key: str, event_id: str, error: str
+    ) -> None:
+        """Fail a queued owner conditionally, preserving any existing media."""
+        event = await self.store.get_event(event_id)
+        if event is not None:
+            await self.finish_capture(
+                event_id, sum(media.available for media in event.media), error,
+                resource_key=resource_key, reason="before_capture",
+            )
+
+    async def run_resource_capture(
+        self, resource_key: str, expected_event_id: str | None = None
+    ) -> None:
+        """Serialize capture for a specific resource under dynamic slot concurrency.
+
+        ``expected_event_id`` pins the exact durable owner the dispatch registered.
+        If the session binding moved to a different event before this wrapper
+        acquired its slot, the successor is rescheduled instead of silently
+        capturing a different episode under the old task bookkeeping.
+        """
         session = await self.store.get_resource_session(resource_key)
         if not session or not session.active_event_id:
             return
+        if expected_event_id is not None and session.active_event_id != expected_event_id:
+            await self.coordinator.request_resource_reschedule(resource_key)
+            return
 
+        expected_event_id = expected_event_id or session.active_event_id
         event_id = session.active_event_id
         session_config = dict(session.recorder_config or {})
         configured_adapter = session_config.get("adapter")
         if configured_adapter not in (None, "camera"):
-            await self.store.update_capture_state(
-                event_id, "failed", error_code="UNSUPPORTED_ADAPTER"
-            )
-            await self.store.clear_resource_session(resource_key)
+            await self._finish_before_capture(resource_key, event_id, "UNSUPPORTED_ADAPTER")
             return
 
         profile_snapshot = dict(session_config.get("_event_recording_profile") or {})
@@ -171,10 +232,7 @@ class CaptureExecutor:
         )
         if is_expired:
             self.coordinator.expired_captures_count += 1
-            await self.store.update_capture_state(
-                event_id, "failed", error_code=ERROR_EXPIRED_WINDOW
-            )
-            await self.store.clear_resource_session(resource_key)
+            await self._finish_before_capture(resource_key, event_id, ERROR_EXPIRED_WINDOW)
             return
 
         from .coordinator import QueueOverflowError
@@ -183,10 +241,7 @@ class CaptureExecutor:
             acquired = await self.slot_manager.acquire(timeout_seconds=deadline_seconds)
         except QueueOverflowError:
             self.coordinator.queue_overflow_count += 1
-            await self.store.update_capture_state(
-                event_id, "failed", error_code=ERROR_QUEUE_OVERFLOW
-            )
-            await self.store.clear_resource_session(resource_key)
+            await self._finish_before_capture(resource_key, event_id, ERROR_QUEUE_OVERFLOW)
             return
 
         if not acquired:
@@ -202,8 +257,7 @@ class CaptureExecutor:
                 self.coordinator.queue_timeouts_count += 1
                 err_code = ERROR_QUEUE_TIMEOUT
 
-            await self.store.update_capture_state(event_id, "failed", error_code=err_code)
-            await self.store.clear_resource_session(resource_key)
+            await self._finish_before_capture(resource_key, event_id, err_code)
             return
 
         valid_clips_count = 0
@@ -215,12 +269,19 @@ class CaptureExecutor:
             fresh_session = await self.store.get_resource_session(resource_key)
             if not fresh_session or not fresh_session.active_event_id:
                 return
+            if (
+                expected_event_id is not None
+                and fresh_session.active_event_id != expected_event_id
+            ):
+                # The binding moved while waiting for a slot; hand off to the
+                # successor without touching its session or event.
+                await self.coordinator.request_resource_reschedule(resource_key)
+                return
             session = fresh_session
             event_id = session.active_event_id
 
             event: RecordedEvent | None = await self.store.get_event(event_id)
             if not event:
-                await self.store.clear_resource_session(resource_key)
                 return
             valid_clips_count = sum(1 for media in event.media if media.available)
 
@@ -231,10 +292,7 @@ class CaptureExecutor:
                 and now >= session.desired_capture_end
             ):
                 self.coordinator.expired_captures_count += 1
-                await self.store.update_capture_state(
-                    event_id, "failed", error_code=ERROR_EXPIRED_WINDOW
-                )
-                await self.store.clear_resource_session(resource_key)
+                await self._finish_before_capture(resource_key, event_id, ERROR_EXPIRED_WINDOW)
                 return
 
             capture_start = now
@@ -297,11 +355,38 @@ class CaptureExecutor:
                 # Revalidate scene state with fresh session
                 fresh_s = await self.store.get_resource_session(resource_key)
                 if not fresh_s or fresh_s.active_event_id != event_id:
-                    break
+                    # A newer event may own the resource; the conditional finish
+                    # is a no-op in that case and must never clear its session.
+                    async with self.coordinator.admission_lock:
+                        await self.finish_capture(
+                            event_id,
+                            valid_clips_count,
+                            last_error,
+                            resource_key=resource_key,
+                            reason="session_lost",
+                            allow_extension=False,
+                        )
+                    return
                 session = fresh_s
                 now = self.coordinator.now()
                 if not session.hold and now >= session.desired_capture_end:
-                    break
+                    # Normal completion.  The transaction re-reads the current
+                    # session window/hold atomically; an admission that lands
+                    # while this wrapper is settling is observed as an extension.
+                    # The decision clock itself is sampled just before the
+                    # transaction, not inside it.
+                    async with self.coordinator.admission_lock:
+                        finish_result = await self.finish_capture(
+                            event_id,
+                            valid_clips_count,
+                            last_error,
+                            resource_key=resource_key,
+                            reason="completion",
+                            allow_extension=last_error is None,
+                        )
+                    if finish_result is not None and finish_result.status == "extended":
+                        continue
+                    return
 
                 if now >= max_end_time:
                     _LOGGER.info(
@@ -309,7 +394,16 @@ class CaptureExecutor:
                         resource_key,
                         max_window_seconds,
                     )
-                    break
+                    async with self.coordinator.admission_lock:
+                        await self.finish_capture(
+                            event_id,
+                            valid_clips_count,
+                            last_error,
+                            resource_key=resource_key,
+                            reason="hard_cap",
+                            allow_extension=False,
+                        )
+                    return
 
                 max_remaining = (max_end_time - now).total_seconds()
                 remaining = (
@@ -521,16 +615,42 @@ class CaptureExecutor:
                         await self.hass.async_add_executor_job(_cleanup_staging)
 
                 if is_fixed:
-                    break
+                    # native_fixed remains a bounded single-clip policy.
+                    async with self.coordinator.admission_lock:
+                        await self.finish_capture(
+                            event_id,
+                            valid_clips_count,
+                            last_error,
+                            resource_key=resource_key,
+                            reason="native_fixed",
+                            allow_extension=False,
+                        )
+                    return
 
             if event_id:
                 async with self.coordinator.admission_lock:
-                    await self.finish_capture(event_id, valid_clips_count, last_error)
+                    await self.finish_capture(
+                        event_id,
+                        valid_clips_count,
+                        last_error,
+                        resource_key=resource_key,
+                        reason="error" if last_error else "shutdown",
+                        allow_extension=False,
+                    )
 
         except asyncio.CancelledError:
             if event_id:
                 final_state = "partial" if valid_clips_count > 0 else "interrupted"
-                await self.store.update_capture_state(event_id, final_state, error_code="CANCELLED")
+                async with self.coordinator.admission_lock:
+                    await self.finish_capture(
+                        event_id,
+                        valid_clips_count,
+                        "CANCELLED",
+                        resource_key=resource_key,
+                        reason="cancelled",
+                        allow_extension=False,
+                        final_state=final_state,
+                    )
             raise
         finally:
             self.coordinator.go2rtc_buffers.release_event(event_id)

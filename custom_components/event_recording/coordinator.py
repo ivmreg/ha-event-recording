@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 from .capture import ESTIMATED_BYTES_PER_SECOND, CaptureExecutor
+from .capture_supervision import CaptureOwner, CaptureTaskSupervisor
 from .const import (
     CONF_CHUNK_SECONDS,
     CONF_MAX_PARALLEL_RESOURCES,
@@ -210,7 +211,9 @@ class RecordingCoordinator:
         self._running = False
         self._worker_task: asyncio.Task[Any] | None = None
         self._resource_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._task_owners: dict[asyncio.Task[Any], CaptureOwner] = {}
         self._pending_resources: set[str] = set()
+        self._pending_event_ids: dict[str, str] = {}
         self._intent_event = asyncio.Event()
 
         # Slot manager for bounded parallelism
@@ -238,6 +241,8 @@ class RecordingCoordinator:
         # Specialized session and capture execution delegates
         self.session_coordinator = SessionCoordinator(self.store, clock=self.now)
         self._capture_executor = CaptureExecutor(self)
+        self._supervisor = CaptureTaskSupervisor(self)
+        self.registry.register_settled_callback(self._supervisor.request_repair)
 
         self._retention_at: float = 0.0
         self._accounting_at: float = 0.0
@@ -250,6 +255,24 @@ class RecordingCoordinator:
     @property
     def running(self) -> bool:
         return self._running
+
+    def active_capture_event_ids(self) -> set[str]:
+        """Event ids currently fenced by a pending dispatch or live wrapper."""
+        active = {owner.event_id for owner in self._task_owners.values()}
+        active.update(self._pending_event_ids.values())
+        return {event_id for event_id in active if event_id}
+
+    @staticmethod
+    def _capture_owner(session: Any) -> CaptureOwner:
+        """Snapshot exact durable owner identity before spawning a wrapper."""
+        config = dict(getattr(session, "recorder_config", None) or {})
+        profile = dict(config.get("_event_recording_profile") or {})
+        group = profile.get("ownership_group") or config.get("ownership_group")
+        return CaptureOwner(
+            resource_key=session.resource_key,
+            event_id=session.active_event_id,
+            ownership_group=str(group) if group else None,
+        )
 
     def now(self) -> Any:
         return utc_now()
@@ -363,6 +386,20 @@ class RecordingCoordinator:
         """Wake worker loop when a new record intent is admitted."""
         self._intent_event.set()
 
+    async def request_resource_reschedule(self, resource_key: str) -> None:
+        """Re-dispatch a resource whose binding moved before its wrapper started.
+
+        The successor's exact event id is registered together with the pending
+        resource under the admission fence so repair cannot observe a gap.
+        """
+        async with self.admission_lock:
+            session = await self.store.get_resource_session(resource_key)
+            if session is None or not session.active_event_id:
+                return
+            self._pending_resources.add(resource_key)
+            self._pending_event_ids[resource_key] = session.active_event_id
+        self.notify_new_intent()
+
     async def admit_record_intent(self, *args: Any, **kwargs: Any) -> Any:
         """Pin camera-profile defaults to a new session before durable admission."""
         return await self.session_coordinator.admit_record_intent(*args, **kwargs)
@@ -403,10 +440,21 @@ class RecordingCoordinator:
         )
         if hasattr(self.registry, "unregister_settled_callback"):
             self.registry.unregister_settled_callback(self._slot_manager.notify_capacity_changed)
+            self.registry.unregister_settled_callback(self._supervisor.request_repair)
         if hasattr(self.registry, "unbind_ledger"):
             self.registry.unbind_ledger(self.store.storage_ledger)
         self._running = False
         self._intent_event.set()
+
+        # Stop admission/repair before snapshotting wrappers to cancel. Otherwise
+        # an in-progress dispatch could add a new task while unload awaits one.
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
 
         for t in list(self._resource_tasks.values()):
             if not t.done():
@@ -415,16 +463,12 @@ class RecordingCoordinator:
         if self._resource_tasks:
             await asyncio.gather(*self._resource_tasks.values(), return_exceptions=True)
         self._resource_tasks.clear()
+        self._task_owners.clear()
+        self._pending_resources.clear()
+        self._pending_event_ids.clear()
+        self._supervisor.close()
 
         await self.go2rtc_buffers.stop()
-
-        if self._worker_task and not self._worker_task.done():
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-            self._worker_task = None
 
     async def _worker_loop(self) -> None:
         """Main durable coordinator loop polling intents and managing tasks."""
@@ -432,6 +476,7 @@ class RecordingCoordinator:
             try:
                 await self._step_intents()
                 await self._step_resources()
+                await self._supervisor.maintain()
                 await self._periodic_retention()
 
                 # Sleep bounded or wake immediately on new intent notification
@@ -456,43 +501,88 @@ class RecordingCoordinator:
             _LOGGER.debug("RecordingCoordinator leased %d intent(s)", len(intents))
         for intent in intents:
             if intent.operation == "stop":
-                await self.session_coordinator.handle_stop_intent(intent.resource_key)
-                await self.store.complete_record_intent(intent.intent_id, self.worker_id)
+                async with self.admission_lock:
+                    await self.session_coordinator.handle_stop_intent(intent.resource_key)
+                    await self.store.complete_record_intent(intent.intent_id, self.worker_id)
                 continue
 
-            self._pending_resources.add(intent.resource_key)
-            await self.store.complete_record_intent(intent.intent_id, self.worker_id)
+            # The admission fence covers pending-resource registration and the
+            # intent completion together, so repair can never observe an event
+            # after its intent was consumed but before a wrapper owns it.
+            async with self.admission_lock:
+                self._pending_resources.add(intent.resource_key)
+                self._pending_event_ids[intent.resource_key] = intent.event_id
+                await self.store.complete_record_intent(intent.intent_id, self.worker_id)
 
     async def _step_resources(self) -> None:
         """Spawn independent capture task per distinct resource_key, bounded by max_queue_depth."""
         for r_key in tuple(self._pending_resources):
             existing_task = self._resource_tasks.get(r_key)
-            if existing_task is None or existing_task.done():
+            if existing_task is not None and not existing_task.done():
+                continue
+
+            async with self.admission_lock:
+                existing_task = self._resource_tasks.get(r_key)
+                if existing_task is not None and not existing_task.done():
+                    continue
                 session = await self.store.get_resource_session(r_key)
                 if session is None or not session.active_event_id:
                     self._pending_resources.discard(r_key)
+                    self._pending_event_ids.pop(r_key, None)
                     continue
 
                 if self._slot_manager.waiting_tasks >= self.max_queue_depth:
                     self.queue_overflow_count += 1
                     self._pending_resources.discard(r_key)
-                    await self.store.update_capture_state(
-                        session.active_event_id, "failed", error_code=ERROR_QUEUE_OVERFLOW
+                    self._pending_event_ids.pop(r_key, None)
+                    await self._capture_executor._finish_before_capture(
+                        r_key, session.active_event_id, ERROR_QUEUE_OVERFLOW
                     )
-                    await self.store.clear_resource_session(r_key)
                     continue
 
-                self._pending_resources.discard(r_key)
                 _LOGGER.debug(
                     "Spawning capture task for resource %s (event_id=%s)",
                     r_key,
                     session.active_event_id,
                 )
+                owner = self._capture_owner(session)
                 task = asyncio.create_task(
                     self._run_resource_capture(r_key),
                     name=f"event_recording_capture_{r_key}",
                 )
+                self._pending_resources.discard(r_key)
+                self._pending_event_ids.pop(r_key, None)
                 self._resource_tasks[r_key] = task
+                self._task_owners[task] = owner
+                task.add_done_callback(
+                    lambda t, key=r_key, own=owner: self._handle_capture_task_done(
+                        key, t, own
+                    )
+                )
+
+    def _handle_capture_task_done(
+        self,
+        resource_key: str,
+        task: asyncio.Task[Any],
+        owner: CaptureOwner,
+    ) -> None:
+        """Retrieve a wrapper exception and queue exact-owner repair."""
+        cancelled = task.cancelled()
+        exception: BaseException | None = None
+        if not cancelled:
+            try:
+                exception = task.exception()
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception as err:  # pragma: no cover - defensive
+                exception = err
+        if self._resource_tasks.get(resource_key) is task:
+            self._resource_tasks.pop(resource_key, None)
+        self._task_owners.pop(task, None)
+        if self._running:
+            self._supervisor.submit(
+                owner, cancelled=cancelled, failed=exception is not None
+            )
 
     async def _periodic_retention(self) -> None:
         """Run periodic storage ledger reconciliation and retention pruning."""
@@ -529,7 +619,10 @@ class RecordingCoordinator:
 
     async def _run_resource_capture(self, resource_key: str) -> None:
         """Serialize capture for a specific resource under dynamic slot concurrency."""
-        await self._capture_executor.run_resource_capture(resource_key)
+        owner = self._task_owners.get(asyncio.current_task())
+        await self._capture_executor.run_resource_capture(
+            resource_key, expected_event_id=owner.event_id if owner else None
+        )
 
 
 __all__ = [

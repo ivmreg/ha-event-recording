@@ -23,7 +23,12 @@ if TYPE_CHECKING:
 
     from homeassistant.core import HomeAssistant
 
-from .const import DEFAULT_WATCHDOG_PADDING_SECONDS, PROVIDER_GO2RTC, PROVIDER_HOME_ASSISTANT
+from .const import (
+    DEFAULT_WATCHDOG_PADDING_SECONDS,
+    ERROR_MEDIA_SETUP_FAILED,
+    PROVIDER_GO2RTC,
+    PROVIDER_HOME_ASSISTANT,
+)
 from .core.models import sanitize_capture_error
 from .error_diagnostics import format_redacted_exception_traceback
 
@@ -452,6 +457,47 @@ class RecorderRegistry:
         return len(pending) == 0
 
 
+async def _prepare_owned_target(
+    hass: HomeAssistant,
+    target_path: Path | str,
+    *,
+    label: str,
+    camera_entity: str,
+) -> Path:
+    """Resolve and create an owned target directory, normalizing setup failures.
+
+    Path resolution, directory creation, and allowlist checks happen before any
+    native writer exists.  Filesystem/setup errors must not escape the adapter as
+    raw ``OSError`` values because capture task supervision expects a bounded
+    ``RecorderError`` it can settle over.
+    """
+    try:
+        resolved_path = await hass.async_add_executor_job(Path(target_path).resolve)
+        await hass.async_add_executor_job(
+            lambda: resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        )
+        is_allowed = await hass.async_add_executor_job(
+            hass.config.is_allowed_path, str(resolved_path)
+        )
+    except (OSError, RuntimeError, ValueError) as err:
+        _LOGGER.warning(
+            "%s target setup failed for %s: %s",
+            label,
+            camera_entity,
+            type(err).__name__,
+        )
+        raise RecorderError(ERROR_MEDIA_SETUP_FAILED) from err
+
+    if not is_allowed:
+        _LOGGER.error(
+            "%s target path '%s' is not within Home Assistant allowlist_external_dirs",
+            label,
+            resolved_path,
+        )
+        raise RecorderError("MEDIA_ROOT_NOT_ALLOWED")
+    return resolved_path
+
+
 class CameraRecorderAdapter:
     """Captures camera recordings from Home Assistant's shared HLS stream.
 
@@ -487,20 +533,12 @@ class CameraRecorderAdapter:
         event_start_timestamp: float | None = None,
     ) -> dict[str, Any] | None:
         """Capture one stream chunk and return settled backend metadata."""
-        resolved_path = await self.hass.async_add_executor_job(Path(target_path).resolve)
-        await self.hass.async_add_executor_job(
-            lambda: resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_path = await _prepare_owned_target(
+            self.hass,
+            target_path,
+            label="Recording",
+            camera_entity=camera_entity,
         )
-
-        is_allowed = await self.hass.async_add_executor_job(
-            self.hass.config.is_allowed_path, str(resolved_path)
-        )
-        if not is_allowed:
-            _LOGGER.error(
-                "Recording target path '%s' is not within Home Assistant allowlist_external_dirs",
-                resolved_path,
-            )
-            raise RecorderError("MEDIA_ROOT_NOT_ALLOWED")
 
         if self.registry.is_quarantined(camera_entity, ownership_group):
             raise ResourceQuarantinedError(
@@ -678,20 +716,12 @@ class SnapshotRecorderAdapter:
         lock_timeout_seconds: float = 15.0,
     ) -> dict[str, Any]:
         """Execute a single still snapshot with format detection and safe off-loop writes."""
-        resolved_path = await self.hass.async_add_executor_job(Path(target_path).resolve)
-        await self.hass.async_add_executor_job(
-            lambda: resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_path = await _prepare_owned_target(
+            self.hass,
+            target_path,
+            label="Snapshot",
+            camera_entity=camera_entity,
         )
-
-        is_allowed = await self.hass.async_add_executor_job(
-            self.hass.config.is_allowed_path, str(resolved_path)
-        )
-        if not is_allowed:
-            _LOGGER.error(
-                "Snapshot target path '%s' is not within Home Assistant allowlist_external_dirs",
-                resolved_path,
-            )
-            raise RecorderError("MEDIA_ROOT_NOT_ALLOWED")
 
         if self.registry.is_quarantined(camera_entity, ownership_group):
             raise ResourceQuarantinedError(
@@ -958,8 +988,18 @@ class FrigateBufferedAdapter:
         if not re.match(r"^[a-zA-Z0-9_-]+$", clean_name):
             raise RecorderError("INVALID_CAMERA_NAME")
 
-        resolved_path = await asyncio.to_thread(Path(target_path).resolve)
-        await asyncio.to_thread(lambda: resolved_path.parent.mkdir(parents=True, exist_ok=True))
+        try:
+            resolved_path = await asyncio.to_thread(Path(target_path).resolve)
+            await asyncio.to_thread(
+                lambda: resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            )
+        except (OSError, RuntimeError, ValueError) as err:
+            _LOGGER.warning(
+                "Buffered export target setup failed for %s: %s",
+                clean_name,
+                type(err).__name__,
+            )
+            raise RecorderError(ERROR_MEDIA_SETUP_FAILED) from err
 
         import aiohttp
 

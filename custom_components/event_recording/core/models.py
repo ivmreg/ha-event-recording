@@ -229,6 +229,41 @@ class ResourceSession:
 
 
 @dataclass(frozen=True)
+class CaptureFinishResult:
+    """Typed outcome of an atomic conditional capture finalization.
+
+    ``finished`` means the event reached a terminal capture state.
+    ``extended`` means the resource session still owns a future window (or a
+    hold) and the caller must resume capture without resetting local state.
+    ``replaced`` means a different event owns the resource session; nothing was
+    mutated.  ``terminal`` means the event was already finalized.
+    """
+
+    status: str  # "finished" | "extended" | "replaced" | "terminal"
+    event: RecordedEvent | None = None
+    session: ResourceSession | None = None
+
+
+@dataclass(frozen=True)
+class AbandonedCaptureCandidate:
+    """Durable, bounded evidence that an inflight event lost its capture owner.
+
+    ``resource_key`` comes from the event's latest durable start/extend intent
+    (or, as a fallback, the live resource session); it is never derived from
+    ``source_id``.  When no durable identity survives (for example compacted
+    intents plus a cleared session), ``missing_identity`` is set so the caller
+    can report the condition explicitly instead of silently skipping forever.
+    """
+
+    event_id: str
+    resource_key: str | None = None
+    ownership_group: str | None = None
+    capture_state: str = "recording"
+    updated_at: datetime = field(default_factory=utc_now)
+    missing_identity: bool = False
+
+
+@dataclass(frozen=True)
 class MediaPinLease:
     """Opaque time-bounded lease preventing retention deletion."""
 
