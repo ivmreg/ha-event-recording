@@ -33,7 +33,7 @@ from .const import (
 from .core.models import RecordedEvent, format_iso, to_public_dto, to_public_incident_dto, utc_now
 from .core.notifications import RevisionDispatcher
 from .core.store import JournalStore
-from .core.visibility import can_hide_no_activity
+from .core.visibility import can_hide_no_activity, can_hide_video_no_activity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,8 +61,10 @@ def make_event_cursor(event: RecordedEvent) -> str:
 
 def _validate_annotation_exclusion(value: Any) -> dict[str, Any]:
     """Validate a generic top-level annotation field equality filter."""
-    if not isinstance(value, dict) or set(value) != {"namespace", "field", "equals"}:
-        raise vol.Invalid("Expected namespace, field, and equals")
+    allowed = {"namespace", "field", "equals", "media_kinds"}
+    required = {"namespace", "field", "equals"}
+    if not isinstance(value, dict) or not required.issubset(value) or set(value) - allowed:
+        raise vol.Invalid("Expected namespace, field, equals, and optional media_kinds")
 
     namespace = value["namespace"]
     field = value["field"]
@@ -75,6 +77,20 @@ def _validate_annotation_exclusion(value: Any) -> dict[str, Any]:
         raise vol.Invalid("equals must be a JSON scalar")
     if type(expected) is float and not math.isfinite(expected):
         raise vol.Invalid("equals must be finite")
+
+    if "media_kinds" in value:
+        media_kinds = value["media_kinds"]
+        if (
+            not isinstance(media_kinds, list)
+            or not media_kinds
+            or any(
+                not isinstance(kind, str) or kind not in {"image", "video"} for kind in media_kinds
+            )
+            or len(set(media_kinds)) != len(media_kinds)
+        ):
+            raise vol.Invalid(
+                "media_kinds must be a non-empty list of unique 'image' or 'video' values"
+            )
     return value
 
 
@@ -583,7 +599,13 @@ def _matches_activity_exclusion(
     field = exclusion["field"]
     expected = exclusion["equals"]
     if ns == "event_vision" and field == "activity" and expected is False:
-        return event is not None and can_hide_no_activity(to_public_dto(event))
+        if event is None:
+            return False
+        media_kinds = exclusion.get("media_kinds", ("image",))
+        public_event = to_public_dto(event)
+        if "image" in media_kinds and can_hide_no_activity(public_event):
+            return True
+        return "video" in media_kinds and can_hide_video_no_activity(public_event)
     ann = ann_dict.get(ns)
     if not isinstance(ann, dict):
         return False

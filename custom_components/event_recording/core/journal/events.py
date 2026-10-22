@@ -258,16 +258,30 @@ class EventsMixin(JournalStoreBase):
                     and annotation_exclusion["field"] == "activity"
                     and annotation_exclusion["equals"] is False
                 ):
-                    observation_guard = """
-                        AND negative_observation(
-                            events.capture_state, events.capture_error, events.coverage_json,
-                            events.media_revision, a.payload_json,
-                            (SELECT json_group_array(json_object(
+                    media_kinds = annotation_exclusion.get("media_kinds", ("image",))
+                    guard_functions = []
+                    if "image" in media_kinds:
+                        guard_functions.append("negative_observation")
+                    if "video" in media_kinds:
+                        guard_functions.append("negative_video_observation")
+                    if guard_functions:
+                        media_json = """(
+                            SELECT json_group_array(json_object(
                                 'id', m.id, 'kind', m.kind, 'mime_type', m.mime_type,
                                 'available', json(CASE WHEN m.available = 1 THEN 'true' ELSE 'false' END)
-                            )) FROM media AS m WHERE m.event_id = events.event_id)
-                        ) = 1
-                    """
+                            )) FROM media AS m WHERE m.event_id = events.event_id
+                        )"""
+                        guard_calls = " OR ".join(
+                            f"""{function}(
+                                events.capture_state, events.capture_error, events.coverage_json,
+                                events.media_revision, a.payload_json, {media_json}
+                            ) = 1"""
+                            for function in guard_functions
+                        )
+                        observation_guard = f"\n AND ({guard_calls})\n"
+                    else:
+                        # Invalid internal filters must never broaden the exclusion.
+                        observation_guard = "\n AND 0\n"
                 clauses.append(
                     f"""
                     NOT EXISTS (

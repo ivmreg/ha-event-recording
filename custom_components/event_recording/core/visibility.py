@@ -105,6 +105,81 @@ def can_hide_no_activity(event: dict[str, Any]) -> bool:
     return all(isinstance(identity, str) for identity in observed) and set(observed) == set(ids)
 
 
+def can_hide_video_no_activity(event: dict[str, Any]) -> bool:
+    """Opt-in video negative filter; only complete sampling across all clips qualifies.
+
+    The caller accepts the residual risk that activity between sampled frames is
+    missed. Failed/interrupted captures and legacy or unknown coverage stay visible.
+    """
+    annotations = event.get("annotations")
+    if not isinstance(annotations, dict):
+        return False
+    annotation = annotations.get("event_vision")
+    if not isinstance(annotation, dict):
+        return False
+    revision = event.get("media_revision")
+    annotation_revision = annotation.get(
+        "media_revision", annotation.get("expected_media_revision")
+    )
+    if (
+        not _count(revision)
+        or revision == 0
+        or annotation_revision != revision
+        or not _count(annotation_revision)
+    ):
+        return False
+    if annotation.get("status") != "complete" or annotation.get("activity") is not False:
+        return False
+    if annotation.get("error_code") not in (None, ""):
+        return False
+    if event.get("capture_state") not in ("ready", "partial"):
+        return False
+    if event.get("capture_error") not in (None, ""):
+        return False
+
+    media = event.get("media")
+    if not isinstance(media, list) or not media:
+        return False
+    ids = []
+    for item in media:
+        if not isinstance(item, dict) or item.get("available") is not True:
+            return False
+        if item.get("kind") != "video":
+            return False
+        identity = item.get("id")
+        if not isinstance(identity, str) or not identity:
+            return False
+        ids.append(identity)
+    if len(set(ids)) != len(ids):
+        return False
+
+    coverage = annotation.get("coverage")
+    if not isinstance(coverage, dict):
+        return False
+    if coverage.get("observation_state") != "complete" or coverage.get("is_partial") is not False:
+        return False
+    expected = len(ids)
+    for key in ("planned_clips", "sampled_clips", "available_clips"):
+        if not _count(coverage.get(key)) or coverage[key] != expected:
+            return False
+    for key in ("missing_clips", "unselected_clips"):
+        if not _count(coverage.get(key)) or coverage[key] != 0:
+            return False
+
+    frames = annotation.get("frames")
+    if not isinstance(frames, list) or not frames:
+        return False
+    observed = set()
+    for frame in frames:
+        if not isinstance(frame, dict) or not _count(frame.get("offset")):
+            return False
+        identity = frame.get("media_id")
+        if not isinstance(identity, str) or identity not in ids:
+            return False
+        observed.add(identity)
+    return observed == set(ids)
+
+
 def negative_observation_sql(state, error, capture_json, revision, payload_json, media_json) -> int:
     """SQLite WHERE adapter; status/revision freshness are also fenced in SQL."""
     try:
@@ -113,6 +188,36 @@ def negative_observation_sql(state, error, capture_json, revision, payload_json,
             return 0
         return int(
             can_hide_no_activity(
+                {
+                    "capture_state": state,
+                    "capture_error": error,
+                    "coverage": json.loads(capture_json),
+                    "media_revision": revision,
+                    "media": json.loads(media_json),
+                    "annotations": {
+                        "event_vision": {
+                            **payload,
+                            "status": "complete",
+                            "media_revision": revision,
+                        }
+                    },
+                }
+            )
+        )
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def negative_video_observation_sql(
+    state, error, capture_json, revision, payload_json, media_json
+) -> int:
+    """SQLite WHERE adapter for the opt-in video-negative policy."""
+    try:
+        payload = json.loads(payload_json)
+        if not isinstance(payload, dict):
+            return 0
+        return int(
+            can_hide_video_no_activity(
                 {
                     "capture_state": state,
                     "capture_error": error,
