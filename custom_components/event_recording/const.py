@@ -104,6 +104,35 @@ VALID_TIME_QUALITIES = frozenset(
     ]
 )
 
+# Continuity describes how the producer knows the media has no internal hole.
+CONTINUITY_VERIFIED_SEGMENTS = "verified_segments"
+CONTINUITY_CONTIGUOUS = "contiguous"
+CONTINUITY_CONTINUOUS = "continuous"
+CONTINUITY_PROVIDER_VERIFIED = "provider_verified"
+CONTINUITY_PROVIDER_PARTIAL = "provider_partial"
+CONTINUITY_UNVERIFIED = "unverified"
+CONTINUITY_BROKEN = "broken"
+CONTINUITY_INSTANT = "instant"
+VALID_CONTINUITIES = frozenset(
+    [
+        CONTINUITY_VERIFIED_SEGMENTS,
+        CONTINUITY_CONTIGUOUS,
+        CONTINUITY_CONTINUOUS,
+        CONTINUITY_PROVIDER_VERIFIED,
+        CONTINUITY_PROVIDER_PARTIAL,
+        CONTINUITY_UNVERIFIED,
+        CONTINUITY_BROKEN,
+        CONTINUITY_INSTANT,
+    ]
+)
+
+# Where the observed wall-clock interval came from.
+CLOCK_SOURCE_HA_STREAM = "ha_stream"
+CLOCK_SOURCE_GO2RTC = "go2rtc"
+CLOCK_SOURCE_FRIGATE = "frigate_nvr"
+CLOCK_SOURCE_CAMERA = "camera"
+CLOCK_SOURCE_UNKNOWN = "unknown"
+
 # Services
 SERVICE_LOG_EVENT = "log_event"
 SERVICE_RECORD = "record"

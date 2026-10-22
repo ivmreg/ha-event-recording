@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..coverage import VALID_CONTINUITIES, compute_coverage
 from ..media import (
     MediaTypeMismatchError,
     PathTraversalSecurityError,
@@ -147,6 +148,7 @@ class MediaMixin(JournalStoreBase):
                 clock_source=row.get("clock_source"),
                 time_uncertainty_seconds=row.get("time_uncertainty_seconds"),
                 start_offset_seconds=row.get("start_offset_seconds"),
+                continuity=row.get("continuity"),
             )
 
     async def list_finalized_media(
@@ -412,6 +414,7 @@ class MediaMixin(JournalStoreBase):
                 clock_source=clock_source,
                 time_uncertainty_seconds=time_uncertainty_seconds,
                 start_offset_seconds=start_offset_seconds,
+                continuity=None,
             )
             return ev, media_item, (event_id, ev.revision)
 
@@ -432,11 +435,16 @@ class MediaMixin(JournalStoreBase):
         clock_source: str | None = None,
         time_uncertainty_seconds: float | None = None,
         start_offset_seconds: float | None = None,
+        continuity: str | None = None,
         reservation_id: str | None = None,
         adopt_staging: bool = False,
     ) -> tuple[RecordedEvent, MediaItem]:
         """Validate, stage, promote, and attach media asset to event."""
         validate_safe_id(event_id, "event_id")
+        if continuity is not None:
+            continuity = str(continuity).strip().lower()
+            if continuity not in VALID_CONTINUITIES:
+                raise ValueError(f"Invalid continuity: {continuity!r}")
 
         # 0. Verify event exists before any filesystem work
         await asyncio.to_thread(self._sync_verify_event_exists, event_id)
@@ -553,6 +561,7 @@ class MediaMixin(JournalStoreBase):
                     clock_source,
                     time_uncertainty_seconds,
                     start_offset_seconds,
+                    continuity,
                     effective_res_id,
                 )
                 worker_state["commit_succeeded"] = True
@@ -625,6 +634,7 @@ class MediaMixin(JournalStoreBase):
         clock_source: str | None = None,
         time_uncertainty_seconds: float | None = None,
         start_offset_seconds: float | None = None,
+        continuity: str | None = None,
         reservation_id: str | None = None,
     ) -> tuple[RecordedEvent, MediaItem, tuple[str, int, list[tuple[str, int]]] | None]:
         now_dt = utc_now()
@@ -646,8 +656,9 @@ class MediaMixin(JournalStoreBase):
                         id, event_id, kind, mime_type, file_name, duration,
                         size_bytes, available, content_hash, created_at,
                         requested_start, requested_end, capture_start, capture_end,
-                        time_quality, clock_source, time_uncertainty_seconds, start_offset_seconds
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        time_quality, clock_source, time_uncertainty_seconds, start_offset_seconds,
+                        continuity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         media_id,
@@ -667,36 +678,35 @@ class MediaMixin(JournalStoreBase):
                         clock_source,
                         time_uncertainty_seconds,
                         start_offset_seconds,
+                        continuity,
                     ),
                 )
 
-                # Compute actual_duration sum of validated video assets
+                # Coverage is a function of the current media set, never a
+                # ratchet. Recompute intervals, union, and measured gaps.
                 cur.execute(
-                    "SELECT kind, duration FROM media WHERE event_id = ?;",
+                    "SELECT * FROM media WHERE event_id = ?;",
                     (event_id,),
                 )
                 all_media = cur.fetchall()
-                actual_duration = round(
-                    sum(
-                        float(m["duration"])
-                        for m in all_media
-                        if m["kind"] == "video" and m["duration"] is not None
-                    ),
-                    4,
+                new_coverage = compute_coverage(
+                    all_media,
+                    requested_start=ensure_utc(row["start_at"]),
+                    requested_end=ensure_utc(row["desired_capture_end"]),
                 )
-
-                existing_coverage = json.loads(row["coverage_json"]) if row["coverage_json"] else {}
-                preserved_uncertain = bool(
-                    existing_coverage.get("is_uncertain", False)
-                    or is_uncertain
-                    or row["capture_state"] == "partial"
-                )
-
-                new_coverage = {
-                    "actual_duration": actual_duration,
-                    "is_uncertain": preserved_uncertain,
-                    "gaps": None if preserved_uncertain else 0,
-                }
+                if is_uncertain and new_coverage.get("verification") == "verified":
+                    # Explicit producer uncertainty always wins over inferred
+                    # completeness; never promote a clip the producer flagged.
+                    new_coverage.update(
+                        {
+                            "is_uncertain": True,
+                            "verification": "unverified",
+                            "reason": "producer_uncertain",
+                            "gaps": None,
+                            "gap_seconds": None,
+                            "covered_seconds": None,
+                        }
+                    )
                 new_coverage_json = json.dumps(new_coverage)
 
                 new_media_rev = row["media_revision"] + 1
@@ -705,7 +715,10 @@ class MediaMixin(JournalStoreBase):
                 new_state = row["capture_state"]
                 end_at_str = row["end_at"]
                 if finalize:
-                    new_state = "partial" if preserved_uncertain else "ready"
+                    if new_coverage.get("verification") in ("verified", "instant"):
+                        new_state = "ready"
+                    else:
+                        new_state = "partial"
                     if not end_at_str:
                         end_at_str = now_str
                     cur.execute(
@@ -773,5 +786,6 @@ class MediaMixin(JournalStoreBase):
                 clock_source=clock_source,
                 time_uncertainty_seconds=time_uncertainty_seconds,
                 start_offset_seconds=start_offset_seconds,
+                continuity=continuity,
             )
             return ev, media_item, (event_id, ev.revision, incident_notifications)

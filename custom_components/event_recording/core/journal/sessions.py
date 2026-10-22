@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from ..coverage import compute_coverage
 from ..models import (
     AbandonedCaptureCandidate,
     CaptureFinishResult,
@@ -973,6 +974,35 @@ class SessionsMixin(JournalStoreBase):
                     state = "ready"
                     error_code = None
 
+                # The last attach may predate an extension or a failed final
+                # chunk. Recompute against the window this event actually asked
+                # for now, so stale "verified" coverage cannot survive a
+                # finish that reports an error.
+                if valid_clips_count > 0:
+                    cur.execute(
+                        "SELECT * FROM media WHERE event_id = ?;",
+                        (event_id,),
+                    )
+                    media_rows = cur.fetchall()
+                    if media_rows:
+                        finish_coverage = compute_coverage(
+                            media_rows,
+                            requested_start=event.start_at,
+                            requested_end=event.desired_capture_end,
+                        )
+                        if error_code is not None:
+                            finish_coverage["is_uncertain"] = True
+                            finish_coverage["verification"] = "partial"
+                            finish_coverage["reason"] = (
+                                finish_coverage.get("reason")
+                                or sanitize_capture_error(error_code)
+                                or "capture_error"
+                            )
+                        cur.execute(
+                            "UPDATE events SET coverage_json = ? WHERE event_id = ?;",
+                            (json.dumps(finish_coverage), event_id),
+                        )
+
                 updated, notify_tuple = self._sync_apply_capture_state(
                     cur, event_id, state, error_code, now_str
                 )
@@ -1174,8 +1204,18 @@ class SessionsMixin(JournalStoreBase):
                 )
                 has_media = cur.fetchone()["n"] > 0
                 if has_media:
-                    coverage = json.loads(row["coverage_json"] or "{}")
+                    cur.execute(
+                        "SELECT * FROM media WHERE event_id = ?;",
+                        (event_id,),
+                    )
+                    coverage = compute_coverage(
+                        cur.fetchall(),
+                        requested_start=event.start_at,
+                        requested_end=event.desired_capture_end,
+                    )
                     coverage["is_uncertain"] = True
+                    coverage["verification"] = "partial"
+                    coverage["reason"] = coverage.get("reason") or "capture_abandoned"
                     cur.execute(
                         "UPDATE events SET coverage_json = ? WHERE event_id = ?;",
                         (json.dumps(coverage), event_id),
@@ -1237,10 +1277,17 @@ class SessionsMixin(JournalStoreBase):
         current_error = row.get("capture_error")
 
         existing_coverage = json.loads(row["coverage_json"]) if row["coverage_json"] else {}
-        if state == "ready" and (
-            existing_coverage.get("is_uncertain") or current_state == "partial"
-        ):
-            state = "partial"
+        if state == "ready":
+            verification = existing_coverage.get("verification")
+            if existing_coverage.get("is_uncertain") is True:
+                state = "partial"
+            elif verification is not None and verification not in (
+                "verified",
+                "instant",
+            ):
+                # Recompute is allowed to promote partial -> ready, but only
+                # when the current evidence explicitly verifies the window.
+                state = "partial"
 
         state_changed = state != current_state
         error_changed = sanitized_error != current_error

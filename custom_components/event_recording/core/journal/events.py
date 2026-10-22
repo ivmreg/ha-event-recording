@@ -116,6 +116,7 @@ class EventsMixin(JournalStoreBase):
                 clock_source=m.get("clock_source"),
                 time_uncertainty_seconds=m.get("time_uncertainty_seconds"),
                 start_offset_seconds=m.get("start_offset_seconds"),
+                continuity=m.get("continuity"),
             )
             for m in media_rows
         )

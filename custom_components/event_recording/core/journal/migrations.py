@@ -489,3 +489,21 @@ class MigrationsMixin(JournalStoreBase):
             except Exception:
                 cur.execute("ROLLBACK;")
                 raise
+
+        if current_version < 5:
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                # Per-media continuity proof, e.g. "verified_segments" when the
+                # producer proved sequence+1 contiguity, or "broken" on a gap.
+                cur.execute("PRAGMA table_info(media);")
+                media_cols = {col["name"] for col in cur.fetchall()}
+                if "continuity" not in media_cols:
+                    cur.execute("ALTER TABLE media ADD COLUMN continuity TEXT;")
+                cur.execute(
+                    "INSERT INTO schema_info(version, applied_at) VALUES (5, ?);",
+                    (format_iso(self.now()),),
+                )
+                cur.execute("COMMIT;")
+            except Exception:
+                cur.execute("ROLLBACK;")
+                raise

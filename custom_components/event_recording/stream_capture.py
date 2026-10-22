@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -89,6 +90,40 @@ async def _snapshot_segment(hass: HomeAssistant, segment: Any) -> SegmentSnapsho
     )
 
 
+def _attach_observed_interval(
+    result: dict[str, Any],
+    *,
+    observed_start: datetime | None,
+    observed_end: datetime | None,
+    segments: int,
+    max_segment_duration: float,
+    continuity: str,
+) -> None:
+    """Add host-measured interval evidence to a capture result."""
+    if (
+        observed_start is None
+        or observed_end is None
+        or observed_end <= observed_start
+    ):
+        result["observed_start_ts"] = None
+        result["observed_end_ts"] = None
+        result["observed_segments"] = segments
+        result["continuity"] = (
+            "broken" if continuity == "broken" else "unverified"
+        )
+        result["time_uncertainty_seconds"] = None
+        return
+    result["observed_start_ts"] = observed_start.timestamp()
+    result["observed_end_ts"] = observed_end.timestamp()
+    result["observed_segments"] = segments
+    result["continuity"] = continuity
+    # A segment boundary is observed on the host clock, but the exact frame
+    # boundary is quantised by the HLS segmenter; keep that bounded and honest.
+    result["time_uncertainty_seconds"] = round(
+        min(0.5, max(0.1, max_segment_duration / 2.0)), 3
+    )
+
+
 async def _create_writer(
     hass: HomeAssistant, target_path: Path | str, min_segment_duration: float, orientation: int
 ) -> StreamMuxWriter:
@@ -160,6 +195,9 @@ async def async_record_stream(
     completed_live_segments = 0
     written_segments = 0
     last_sequence: int | None = None
+    observed_start: datetime | None = None
+    observed_end: datetime | None = None
+    max_segment_duration = 0.0
     heartbeat_error: BaseException | None = None
     setup_done_at: float | None = None
 
@@ -285,6 +323,22 @@ async def async_record_stream(
                 hass, writer.write_segment, await _snapshot_segment(hass, segment)
             )
             written_segments += 1
+            segment_start = getattr(segment, "start_time", None)
+            if isinstance(segment_start, datetime):
+                if segment_start.tzinfo is None:
+                    segment_start = segment_start.replace(tzinfo=UTC)
+                else:
+                    segment_start = segment_start.astimezone(UTC)
+                segment_end = segment_start + timedelta(
+                    seconds=float(segment.duration or 0.0)
+                )
+                if observed_start is None or segment_start < observed_start:
+                    observed_start = segment_start
+                if observed_end is None or segment_end > observed_end:
+                    observed_end = segment_end
+                max_segment_duration = max(
+                    max_segment_duration, float(segment.duration or 0.0)
+                )
             _LOGGER.debug(
                 "Wrote lookback segment %s for %s: duration=%.2fs",
                 segment.sequence,
@@ -319,6 +373,22 @@ async def async_record_stream(
                 written_segments += 1
                 captured_live_duration += snapshot.duration
                 completed_live_segments += 1
+                segment_start = getattr(snapshot, "start_time", None)
+                if isinstance(segment_start, datetime):
+                    if segment_start.tzinfo is None:
+                        segment_start = segment_start.replace(tzinfo=UTC)
+                    else:
+                        segment_start = segment_start.astimezone(UTC)
+                    segment_end = segment_start + timedelta(
+                        seconds=float(snapshot.duration or 0.0)
+                    )
+                    if observed_start is None or segment_start < observed_start:
+                        observed_start = segment_start
+                    if observed_end is None or segment_end > observed_end:
+                        observed_end = segment_end
+                    max_segment_duration = max(
+                        max_segment_duration, float(snapshot.duration or 0.0)
+                    )
                 _LOGGER.debug(
                     "Wrote live segment %s for %s: seg_dur=%.2fs, captured_live=%.2fs/%.2fs (total written=%d)",
                     segment.sequence,
@@ -349,9 +419,9 @@ async def async_record_stream(
 
         check_provider()
         # A whole-segment capture can exceed the requested duration slightly.
-        result = await _await_executor_job(hass, writer.finish)
+        raw_result = await _await_executor_job(hass, writer.finish)
+        result = dict(raw_result) if isinstance(raw_result, dict) else {}
         if captured_live_duration < duration_seconds:
-            result = dict(result) if isinstance(result, dict) else {}
             shortfall = max(0.0, round(duration_seconds - captured_live_duration, 4))
             result["captured_live_duration"] = captured_live_duration
             result["requested_duration"] = duration_seconds
@@ -371,6 +441,14 @@ async def async_record_stream(
                 written_segments,
                 captured_live_duration,
             )
+        _attach_observed_interval(
+            result,
+            observed_start=observed_start,
+            observed_end=observed_end,
+            segments=written_segments,
+            max_segment_duration=max_segment_duration,
+            continuity="verified_segments",
+        )
         return result
     except StreamCaptureError as err:
         if writer is not None and written_segments > 0:
@@ -380,6 +458,18 @@ async def async_record_stream(
                 raise err from None
             result = dict(res) if isinstance(res, dict) else {}
             result["partial_error"] = getattr(err, "code", STREAM_CAPTURE_FAILED)
+            _attach_observed_interval(
+                result,
+                observed_start=observed_start,
+                observed_end=observed_end,
+                segments=written_segments,
+                max_segment_duration=max_segment_duration,
+                continuity=(
+                    "broken"
+                    if getattr(err, "code", None) == STREAM_SEQUENCE_GAP
+                    else "unverified"
+                ),
+            )
             _LOGGER.debug(
                 "Stream capture partial recovery for %s: written=%d, error=%s",
                 camera_entity,

@@ -19,7 +19,7 @@ from ..storage_ledger import StorageLedger, StoragePolicy
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_PIN_LEASE_SECONDS = 900.0
 DEFAULT_PIN_LEASE_SECONDS = 300.0
 

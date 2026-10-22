@@ -1024,6 +1024,22 @@ class Go2rtcBufferManager:
         live_duration = 0.0
         written_bytes = 0
         handoff_deadline: float | None = None
+        observed_start_wall: float | None = None
+        observed_end_wall: float | None = None
+        max_observed_fragment = 0.0
+        written_fragments = 0
+
+        def note_written_fragment(fragment: BufferedFragment) -> None:
+            nonlocal observed_start_wall, observed_end_wall
+            nonlocal max_observed_fragment, written_fragments
+            fragment_duration = max(0.0, float(fragment.duration))
+            fragment_start = float(fragment.observed_wall) - fragment_duration
+            if observed_start_wall is None or fragment_start < observed_start_wall:
+                observed_start_wall = fragment_start
+            if observed_end_wall is None or fragment.observed_wall > observed_end_wall:
+                observed_end_wall = float(fragment.observed_wall)
+            max_observed_fragment = max(max_observed_fragment, fragment_duration)
+            written_fragments += 1
 
         async def write_fragment(
             fragment: BufferedFragment, *, start: int, end: int | None = None
@@ -1050,6 +1066,7 @@ class Go2rtcBufferManager:
                     cancellation = cancelled
                     raise cancelled
                 written_bytes += fragment.size_bytes
+                note_written_fragment(fragment)
             deadline = started + max(1.0, timeout_seconds)
             while time.monotonic() < deadline:
                 now = time.monotonic()
@@ -1117,6 +1134,7 @@ class Go2rtcBufferManager:
                             cancellation = cancelled
                             raise cancelled
                         written_bytes += fragment.size_bytes
+                        note_written_fragment(fragment)
                         live_duration += sum(
                             fragment.packet_durations[start_index:next_boundary]
                         )
@@ -1135,6 +1153,7 @@ class Go2rtcBufferManager:
                     cancellation = cancelled
                     raise cancelled
                 written_bytes += fragment.size_bytes
+                note_written_fragment(fragment)
                 live_duration += sum(fragment.packet_durations[start_index:])
                 cursor = fragment.sequence + 1
                 cursor_packet = 0
@@ -1160,12 +1179,28 @@ class Go2rtcBufferManager:
                 "video_track_count": int(finish_result.get("video_track_count", 0)),
                 "audio_track_count": int(finish_result.get("audio_track_count", 0)),
                 "written_packet_count": int(finish_result.get("packets_written", 0)),
-                "continuity": "continuous" if partial_error is None else "partial",
+                "continuity": (
+                    "continuous"
+                    if partial_error is None
+                    else (
+                        "broken"
+                        if partial_error == "STREAM_SEQUENCE_GAP"
+                        else "unverified"
+                    )
+                ),
                 "partial_state": partial_error,
                 "generation": generation,
                 "partial_error": partial_error,
-                "time_quality": "unknown",
-                "clock_source": "unknown",
+                "observed_start_ts": observed_start_wall,
+                "observed_end_ts": observed_end_wall,
+                "observed_segments": written_fragments,
+                "time_quality": "estimated" if observed_start_wall is not None else "unknown",
+                "clock_source": "go2rtc",
+                "time_uncertainty_seconds": (
+                    round(min(5.0, max(0.1, max_observed_fragment)), 3)
+                    if observed_start_wall is not None and observed_end_wall is not None
+                    else None
+                ),
             }
             self.note_export(
                 alias,

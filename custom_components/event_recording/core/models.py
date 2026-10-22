@@ -149,6 +149,7 @@ class MediaItem:
     clock_source: str | None = "unknown"
     time_uncertainty_seconds: float | None = None
     start_offset_seconds: float | None = None
+    continuity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +333,8 @@ def to_public_dto(event: RecordedEvent, *, omit_correlation: bool = False) -> di
             m_dict["time_uncertainty_seconds"] = m.time_uncertainty_seconds
         if m.start_offset_seconds is not None:
             m_dict["start_offset_seconds"] = m.start_offset_seconds
+        if m.continuity is not None:
+            m_dict["continuity"] = m.continuity
         media_dto.append(m_dict)
 
     # Process annotations: flatten safely, hide obsolete annotations, hide raw reservation owner/payload internals

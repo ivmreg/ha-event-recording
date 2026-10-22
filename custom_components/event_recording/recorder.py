@@ -15,6 +15,7 @@ import re
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -735,7 +736,9 @@ class SnapshotRecorderAdapter:
             async def _do_snapshot() -> dict[str, Any]:
                 from homeassistant.components.camera import async_get_image
 
+                requested_wall = time.time()
                 image = await async_get_image(self.hass, camera_entity)
+                observed_wall = time.time()
                 content = image.content
                 if not content or len(content) < 100:
                     raise RecorderError("EMPTY_SNAPSHOT_OUTPUT")
@@ -751,13 +754,17 @@ class SnapshotRecorderAdapter:
                     raise RecorderError("UNRECOGNIZED_IMAGE_FORMAT")
 
                 await self.hass.async_add_executor_job(resolved_path.write_bytes, content)
+                observed_at = datetime.fromtimestamp(observed_wall, tz=UTC)
                 return {
                     "mime_type": mime_type,
                     "size_bytes": len(content),
-                    "capture_start": None,
-                    "capture_end": None,
-                    "time_quality": "unknown",
-                    "clock_source": "unknown",
+                    "capture_start": observed_at,
+                    "capture_end": observed_at,
+                    "time_quality": "estimated",
+                    "clock_source": "ha_stream",
+                    "time_uncertainty_seconds": round(
+                        min(5.0, max(0.0, observed_wall - requested_wall)), 3
+                    ),
                 }
 
             op_task = asyncio.create_task(_do_snapshot())

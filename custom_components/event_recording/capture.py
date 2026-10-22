@@ -18,8 +18,13 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 from .const import (
+    CLOCK_SOURCE_FRIGATE,
+    CLOCK_SOURCE_GO2RTC,
+    CLOCK_SOURCE_HA_STREAM,
     CONF_GO2RTC_STREAM,
     CONF_RECORDING_PROVIDER,
+    CONTINUITY_BROKEN,
+    CONTINUITY_UNVERIFIED,
     DEFAULT_EXPORT_DELAY_SECONDS,
     ERROR_BUFFER_UNAVAILABLE,
     ERROR_EXPIRED_WINDOW,
@@ -33,8 +38,10 @@ from .const import (
     MODE_NATIVE_SNAPSHOT,
     PROVIDER_GO2RTC,
     PROVIDER_HOME_ASSISTANT,
+    TIME_QUALITY_ESTIMATED,
+    TIME_QUALITY_HOST,
     TIME_QUALITY_PROVIDER_REPORTED,
-    TIME_QUALITY_UNKNOWN,
+    VALID_CONTINUITIES,
 )
 from .core.models import (
     CaptureFinishResult,
@@ -57,6 +64,78 @@ _LOGGER = logging.getLogger(__name__)
 
 # Nominal bytes per second of camera capture (1 MiB/s unmeasured nominal allocation)
 ESTIMATED_BYTES_PER_SECOND = 1024 * 1024
+
+
+def _observed_interval(
+    chunk_result: Any,
+) -> tuple[datetime | None, datetime | None, str, float | None]:
+    """Read measured interval evidence from an adapter result.
+
+    Producers that did not measure a clock return no interval; that is
+    deliberately represented as ``None`` rather than fabricated timing.
+    """
+    if not isinstance(chunk_result, dict):
+        return None, None, CONTINUITY_UNVERIFIED, None
+    raw_start = chunk_result.get("observed_start_ts")
+    raw_end = chunk_result.get("observed_end_ts")
+    start = end = None
+    if (
+        isinstance(raw_start, (int, float))
+        and not isinstance(raw_start, bool)
+        and isinstance(raw_end, (int, float))
+        and not isinstance(raw_end, bool)
+    ):
+        if float(raw_end) > float(raw_start):
+            start = datetime.fromtimestamp(float(raw_start), tz=UTC)
+            end = datetime.fromtimestamp(float(raw_end), tz=UTC)
+    continuity = str(chunk_result.get("continuity") or CONTINUITY_UNVERIFIED).lower()
+    if continuity not in VALID_CONTINUITIES:
+        continuity = CONTINUITY_UNVERIFIED
+    raw_uncertainty = chunk_result.get("time_uncertainty_seconds")
+    uncertainty = (
+        float(raw_uncertainty)
+        if isinstance(raw_uncertainty, (int, float))
+        and not isinstance(raw_uncertainty, bool)
+        and float(raw_uncertainty) >= 0
+        else None
+    )
+    return start, end, continuity, uncertainty
+
+
+def _chunk_evidence(
+    chunk_result: Any,
+    *,
+    provider: str,
+    partial_error: str | None,
+) -> tuple[datetime | None, datetime | None, str, str, str, float | None, bool]:
+    """Map adapter-specific evidence to the shared provenance vocabulary."""
+    start, end, continuity, uncertainty = _observed_interval(chunk_result)
+    if provider == PROVIDER_GO2RTC:
+        quality = TIME_QUALITY_ESTIMATED
+        clock_source = CLOCK_SOURCE_GO2RTC
+    else:
+        quality = TIME_QUALITY_HOST
+        clock_source = CLOCK_SOURCE_HA_STREAM
+    if partial_error:
+        if partial_error == "STREAM_SEQUENCE_GAP":
+            continuity = CONTINUITY_BROKEN
+        elif continuity not in (CONTINUITY_BROKEN,):
+            continuity = CONTINUITY_UNVERIFIED
+    uncertain = (
+        partial_error is not None
+        or start is None
+        or end is None
+        or quality != TIME_QUALITY_HOST
+    )
+    return (
+        start,
+        end,
+        continuity,
+        quality,
+        clock_source,
+        uncertainty,
+        uncertain,
+    )
 
 
 class CaptureContext(Protocol):
@@ -538,20 +617,34 @@ class CaptureExecutor:
                             last_error = ERROR_RESOURCE_QUARANTINED
                             break
                         try:
+                            (
+                                chunk_capture_start,
+                                chunk_capture_end,
+                                chunk_continuity,
+                                chunk_time_quality,
+                                chunk_clock_source,
+                                chunk_uncertainty,
+                                chunk_uncertain,
+                            ) = _chunk_evidence(
+                                chunk_result,
+                                provider=recording_provider,
+                                partial_error=partial_error,
+                            )
                             promoted_result = await self.store.attach_and_promote_media(
                                 event_id=event_id,
                                 src_path=staging_path,
                                 kind="video",
                                 mime_type="video/mp4",
-                                is_uncertain=True,
+                                is_uncertain=chunk_uncertain,
                                 finalize=False,
                                 requested_start=chunk_req_start,
                                 requested_end=chunk_req_end,
-                                capture_start=None,
-                                capture_end=None,
-                                time_quality=TIME_QUALITY_UNKNOWN,
-                                clock_source="unknown",
-                                time_uncertainty_seconds=None,
+                                capture_start=chunk_capture_start,
+                                capture_end=chunk_capture_end,
+                                time_quality=chunk_time_quality,
+                                clock_source=chunk_clock_source,
+                                time_uncertainty_seconds=chunk_uncertainty,
+                                continuity=chunk_continuity,
                                 reservation_id=res_id,
                                 adopt_staging=True,
                             )
@@ -696,10 +789,12 @@ class CaptureExecutor:
                 finalize=True,
                 requested_start=event.start_at,
                 requested_end=event.start_at,
-                capture_start=None,
-                capture_end=None,
-                time_quality=TIME_QUALITY_UNKNOWN,
-                clock_source="unknown",
+                capture_start=snap_meta.get("capture_start"),
+                capture_end=snap_meta.get("capture_end"),
+                time_quality=snap_meta.get("time_quality") or TIME_QUALITY_ESTIMATED,
+                clock_source=snap_meta.get("clock_source") or CLOCK_SOURCE_HA_STREAM,
+                time_uncertainty_seconds=snap_meta.get("time_uncertainty_seconds"),
+                continuity="instant",
                 reservation_id=res_id,
                 adopt_staging=True,
             )
@@ -829,7 +924,11 @@ class CaptureExecutor:
                 capture_start=actual_start_dt,
                 capture_end=actual_end_dt,
                 time_quality=TIME_QUALITY_PROVIDER_REPORTED,
-                clock_source="frigate_nvr",
+                clock_source=CLOCK_SOURCE_FRIGATE,
+                time_uncertainty_seconds=0.5,
+                continuity=(
+                    "provider_partial" if is_partial else "provider_verified"
+                ),
                 reservation_id=res_id,
                 adopt_staging=True,
             )
