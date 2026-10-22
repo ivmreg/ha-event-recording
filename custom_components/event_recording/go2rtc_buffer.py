@@ -1171,6 +1171,7 @@ class Go2rtcBufferManager:
             result = {
                 "downloaded_bytes": written_bytes,
                 "requested_duration": duration_seconds + (lookback_seconds if selected else 0),
+                "captured_live_seconds": live_duration,
                 "buffered_preroll_seconds": obtained_preroll,
                 "requested_preroll_seconds": lookback_seconds if include_preroll else 0.0,
                 "obtained_preroll_seconds": obtained_preroll,

@@ -43,6 +43,7 @@ from .const import (
     TIME_QUALITY_PROVIDER_REPORTED,
     VALID_CONTINUITIES,
 )
+from .core.capture_metrics import chunk_capture_metrics
 from .core.models import (
     CaptureFinishResult,
     RecordedEvent,
@@ -645,6 +646,12 @@ class CaptureExecutor:
                                 clock_source=chunk_clock_source,
                                 time_uncertainty_seconds=chunk_uncertainty,
                                 continuity=chunk_continuity,
+                                capture_metrics=chunk_capture_metrics(
+                                    chunk_result, provider=recording_provider,
+                                    requested_live_seconds=chunk_dur,
+                                    requested_preroll_seconds=lookback,
+                                    partial_error=partial_error,
+                                ),
                                 reservation_id=res_id,
                                 adopt_staging=True,
                             )

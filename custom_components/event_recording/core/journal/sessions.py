@@ -980,7 +980,7 @@ class SessionsMixin(JournalStoreBase):
                 # finish that reports an error.
                 if valid_clips_count > 0:
                     cur.execute(
-                        "SELECT * FROM media WHERE event_id = ?;",
+                        "SELECT * FROM media WHERE event_id = ? ORDER BY created_at, rowid;",
                         (event_id,),
                     )
                     media_rows = cur.fetchall()
@@ -989,6 +989,7 @@ class SessionsMixin(JournalStoreBase):
                             media_rows,
                             requested_start=event.start_at,
                             requested_end=event.desired_capture_end,
+                            previous_coverage=event.coverage,
                         )
                         if error_code is not None:
                             finish_coverage["is_uncertain"] = True
@@ -1205,13 +1206,14 @@ class SessionsMixin(JournalStoreBase):
                 has_media = cur.fetchone()["n"] > 0
                 if has_media:
                     cur.execute(
-                        "SELECT * FROM media WHERE event_id = ?;",
+                        "SELECT * FROM media WHERE event_id = ? ORDER BY created_at, rowid;",
                         (event_id,),
                     )
                     coverage = compute_coverage(
                         cur.fetchall(),
                         requested_start=event.start_at,
                         requested_end=event.desired_capture_end,
+                        previous_coverage=event.coverage,
                     )
                     coverage["is_uncertain"] = True
                     coverage["verification"] = "partial"

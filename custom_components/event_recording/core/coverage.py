@@ -35,6 +35,7 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any
 
+from .capture_metrics import retained_capture_metrics
 from .models import ensure_utc, format_iso
 
 COVERAGE_VERSION = 2
@@ -109,6 +110,29 @@ def _seconds(start: datetime, end: datetime) -> float:
 
 
 def compute_coverage(
+    media: Iterable[Mapping[str, Any] | Any],
+    *,
+    requested_start: datetime | None,
+    requested_end: datetime | None,
+    gap_tolerance_seconds: float = DEFAULT_GAP_TOLERANCE_SECONDS,
+    previous_coverage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Recompute timeline evidence and preserve bounded producer measurements."""
+    rows = list(media)
+    coverage = _compute_coverage(
+        rows, requested_start=requested_start, requested_end=requested_end,
+        gap_tolerance_seconds=gap_tolerance_seconds,
+    )
+    req_start, req_end = _as_utc(requested_start), _as_utc(requested_end)
+    coverage["requested_seconds"] = (
+        round(_seconds(req_start, req_end), 4)
+        if req_start is not None and req_end is not None and req_end >= req_start else None
+    )
+    coverage.update(retained_capture_metrics(rows, previous_coverage))
+    return coverage
+
+
+def _compute_coverage(
     media: Iterable[Mapping[str, Any] | Any],
     *,
     requested_start: datetime | None,

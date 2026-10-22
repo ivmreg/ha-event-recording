@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..capture_metrics import normalize_capture_metrics
 from ..coverage import VALID_CONTINUITIES, compute_coverage
 from ..media import (
     MediaTypeMismatchError,
@@ -436,6 +437,7 @@ class MediaMixin(JournalStoreBase):
         time_uncertainty_seconds: float | None = None,
         start_offset_seconds: float | None = None,
         continuity: str | None = None,
+        capture_metrics: dict[str, Any] | None = None,
         reservation_id: str | None = None,
         adopt_staging: bool = False,
     ) -> tuple[RecordedEvent, MediaItem]:
@@ -562,6 +564,7 @@ class MediaMixin(JournalStoreBase):
                     time_uncertainty_seconds,
                     start_offset_seconds,
                     continuity,
+                    capture_metrics,
                     effective_res_id,
                 )
                 worker_state["commit_succeeded"] = True
@@ -635,6 +638,7 @@ class MediaMixin(JournalStoreBase):
         time_uncertainty_seconds: float | None = None,
         start_offset_seconds: float | None = None,
         continuity: str | None = None,
+        capture_metrics: dict[str, Any] | None = None,
         reservation_id: str | None = None,
     ) -> tuple[RecordedEvent, MediaItem, tuple[str, int, list[tuple[str, int]]] | None]:
         now_dt = utc_now()
@@ -685,14 +689,21 @@ class MediaMixin(JournalStoreBase):
                 # Coverage is a function of the current media set, never a
                 # ratchet. Recompute intervals, union, and measured gaps.
                 cur.execute(
-                    "SELECT * FROM media WHERE event_id = ?;",
+                    "SELECT * FROM media WHERE event_id = ? ORDER BY created_at, rowid;",
                     (event_id,),
                 )
                 all_media = cur.fetchall()
+                previous_coverage = json.loads(row["coverage_json"] or "{}")
+                report = normalize_capture_metrics(capture_metrics)
+                if report:
+                    # The probe remains authoritative; adapter output cannot override it.
+                    report = normalize_capture_metrics({**report, "probed_duration_seconds": duration})
+                    previous_coverage.setdefault("capture_metrics", {})[media_id] = report
                 new_coverage = compute_coverage(
                     all_media,
                     requested_start=ensure_utc(row["start_at"]),
                     requested_end=ensure_utc(row["desired_capture_end"]),
+                    previous_coverage=previous_coverage,
                 )
                 if is_uncertain and new_coverage.get("verification") == "verified":
                     # Explicit producer uncertainty always wins over inferred
