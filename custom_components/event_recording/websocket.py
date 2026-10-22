@@ -33,6 +33,7 @@ from .const import (
 from .core.models import RecordedEvent, format_iso, to_public_dto, to_public_incident_dto, utc_now
 from .core.notifications import RevisionDispatcher
 from .core.store import JournalStore
+from .core.visibility import can_hide_no_activity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -575,11 +576,14 @@ def _matches_activity_exclusion(
     ann_dict: dict[str, Any],
     exclusion: dict[str, Any],
     event_media_revision: int | None = None,
+    event: RecordedEvent | None = None,
 ) -> bool:
     """Return True if annotation payload equals the excluded value and media revision is fresh."""
     ns = exclusion["namespace"]
     field = exclusion["field"]
     expected = exclusion["equals"]
+    if ns == "event_vision" and field == "activity" and expected is False:
+        return event is not None and can_hide_no_activity(to_public_dto(event))
     ann = ann_dict.get(ns)
     if not isinstance(ann, dict):
         return False
@@ -595,7 +599,12 @@ def _matches_activity_exclusion(
         payload = {
             k: v for k, v in ann.items() if k not in ("worker_id", "reserved_by", "reserved_until")
         }
-    return payload.get(field) == expected
+    if field not in payload:
+        return False
+    actual = payload[field]
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected
+    return actual == expected
 
 
 @websocket_api.websocket_command(
@@ -642,15 +651,20 @@ async def ws_handle_list_activity(
     exclude_journal_only = msg.get("exclude_journal_only") is True
     annotation_exclusion = msg.get("exclude_current_complete_annotation")
 
+    def _is_journal_only(ev: RecordedEvent) -> bool:
+        # Match list_events and the card: missing media and capture failures are
+        # useful warnings, rather than successful journal-only captures.
+        return not ev.media and not ev.capture_error and ev.capture_state in ("ready", "expired")
+
     def _event_passes_filters(ev: RecordedEvent) -> bool:
         if source_id_filter and ev.source_id != source_id_filter:
             return False
         if kind_filter and ev.kind != kind_filter:
             return False
-        if exclude_journal_only and not any(m.available for m in ev.media):
+        if exclude_journal_only and _is_journal_only(ev):
             return False
         if annotation_exclusion and _matches_activity_exclusion(
-            ev.annotations, annotation_exclusion, ev.media_revision
+            ev.annotations, annotation_exclusion, ev.media_revision, event=ev
         ):
             return False
         return True
@@ -660,17 +674,15 @@ async def ws_handle_list_activity(
             return False
         if kind_filter and not any(m.kind == kind_filter for m in members):
             return False
-        if exclude_journal_only and not any(
-            any(media.available for media in m.media) for m in members
-        ):
+        if exclude_journal_only and members and all(_is_journal_only(m) for m in members):
             return False
         if annotation_exclusion:
-            # All known inactive group may hide, any member known active (or unknown) keeps group
-            # If ANY member is unknown (no annotation or not complete) or active (does not match exclusion),
-            # the group is KEPT. Only hide if EVERY member has a complete annotation on current media_revision
-            # that matches the exclusion!
+            # A group hides only when every member independently qualifies.
+            # Unknown observations or capture warnings keep the group visible.
             if len(members) > 0 and all(
-                _matches_activity_exclusion(m.annotations, annotation_exclusion, m.media_revision)
+                _matches_activity_exclusion(
+                    m.annotations, annotation_exclusion, m.media_revision, event=m
+                )
                 for m in members
             ):
                 return False

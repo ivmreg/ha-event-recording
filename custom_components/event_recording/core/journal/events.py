@@ -251,8 +251,24 @@ class EventsMixin(JournalStoreBase):
                 namespace = annotation_exclusion["namespace"]
                 field_path = f"$.{annotation_exclusion['field']}"
                 encoded_value = json.dumps(annotation_exclusion["equals"], allow_nan=False)
-                clauses.append(
+                observation_guard = ""
+                if (
+                    namespace == "event_vision"
+                    and annotation_exclusion["field"] == "activity"
+                    and annotation_exclusion["equals"] is False
+                ):
+                    observation_guard = """
+                        AND negative_observation(
+                            events.capture_state, events.capture_error, events.coverage_json,
+                            events.media_revision, a.payload_json,
+                            (SELECT json_group_array(json_object(
+                                'id', m.id, 'kind', m.kind, 'mime_type', m.mime_type,
+                                'available', json(CASE WHEN m.available = 1 THEN 'true' ELSE 'false' END)
+                            )) FROM media AS m WHERE m.event_id = events.event_id)
+                        ) = 1
                     """
+                clauses.append(
+                    f"""
                     NOT EXISTS (
                         SELECT 1
                         FROM annotations AS a
@@ -268,6 +284,7 @@ class EventsMixin(JournalStoreBase):
                               )
                           )
                           AND json_extract(a.payload_json, ?) IS json_extract(?, '$')
+                          {observation_guard}
                     )
                     """
                 )

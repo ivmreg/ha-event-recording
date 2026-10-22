@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import format_iso, utc_now
+from ..visibility import negative_observation_sql
 from .common import SCHEMA_VERSION, JournalStoreBase, _dict_factory
 
 _LOGGER = logging.getLogger(__name__)
@@ -134,6 +135,7 @@ class MigrationsMixin(JournalStoreBase):
                 isolation_level=None,  # Autocommit mode; explicit BEGIN for transactions
             )
             conn.row_factory = _dict_factory
+            conn.create_function("negative_observation", 6, negative_observation_sql, deterministic=True)
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.execute("PRAGMA synchronous = FULL;")
             conn.execute("PRAGMA foreign_keys = ON;")
