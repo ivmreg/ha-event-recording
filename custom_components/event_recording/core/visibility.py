@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 
@@ -171,7 +172,16 @@ def can_hide_video_no_activity(event: dict[str, Any]) -> bool:
         return False
     observed = set()
     for frame in frames:
-        if not isinstance(frame, dict) or not _count(frame.get("offset")):
+        if not isinstance(frame, dict):
+            return False
+        # Offsets are elapsed seconds; unlike counts, they may be fractional.
+        offset = frame.get("offset")
+        if (
+            not isinstance(offset, (int, float))
+            or isinstance(offset, bool)
+            or not 0 <= offset <= 2**53 - 1
+            or not math.isfinite(offset)
+        ):
             return False
         identity = frame.get("media_id")
         if not isinstance(identity, str) or identity not in ids:
