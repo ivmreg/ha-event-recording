@@ -2,7 +2,7 @@
 
 Durable event journaling, optional camera capture, private media, and a timeline card. Recording runs independently of analysis. Native Home Assistant automations supply arbitrary triggers; no camera or cloud key is required for event-only use.
 
-Requires Home Assistant **2026.10.1** or later. Version **0.7.16**.
+Requires Home Assistant **2026.10.1** or later. Version **0.7.17**.
 
 ## HACS custom repository
 
@@ -18,7 +18,7 @@ HACS requires public GitHub repositories; a private staging mirror is not instal
 2. Add **Event Recording** under Settings > Devices & services.
 3. Keep the default private media directory, `event_recording_media`, or choose another private directory.
 4. For native camera recording, merge `/config/event_recording_media` into `homeassistant.allowlist_external_dirs`, validate configuration, and restart.
-5. Register `/event_recording/event-card.js?v=0.7.16` as a JavaScript module dashboard resource.
+5. Register `/event_recording/event-card.js?v=0.7.17` as a JavaScript module dashboard resource.
 6. Add a card with `type: custom:event-recording-card` and `page_size: 20`.
 
 The card is bundled with this integration and updates with it. No separate card repository is required.
