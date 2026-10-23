@@ -25,7 +25,7 @@ Manual copy into `custom_components/` remains supported.
 
 | Component | Role | Required Dependencies | Cloud / API Key |
 |---|---|---|---|
-| **`event_recording` (0.7.15)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
+| **`event_recording` (0.7.16)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
 | **`event_vision` (0.5.5)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
 
 ---
@@ -101,7 +101,7 @@ Validate configuration and restart after this manual change. Use your actual con
 1. In Home Assistant, navigate to **Settings -> Dashboards -> Resources** (or menu dots in Lovelace UI -> Manage resources).
 2. Click **Add Resource**.
 3. Fill in the resource details:
-   - **URL:** `/event_recording/event-card.js?v=0.7.15`
+   - **URL:** `/event_recording/event-card.js?v=0.7.16`
    - **Resource Type:** `JavaScript Module`
 4. Click **Create**.
 5. You can now add the card to any Lovelace view:
@@ -111,7 +111,7 @@ Validate configuration and restart after this manual change. Use your actual con
    ```
 
 > [!TIP]
-> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.15`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
+> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.16`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
 
 ---
 
