@@ -87,7 +87,7 @@ class FFmpegProbe(MediaProbe):
             "-v",
             "error",
             "-show_entries",
-            "format=duration,format_name:stream=codec_type,codec_name,width,height",
+            "format=duration,format_name:stream=codec_type,codec_name,width,height,duration",
             "-of",
             "json",
             str(path),
@@ -115,7 +115,14 @@ class FFmpegProbe(MediaProbe):
         for st in streams:
             if st.get("codec_type") == "video":
                 codec = st.get("codec_name", "").lower()
-                dur_raw = format_info.get("duration") or st.get("duration")
+                # The format duration may include audio after the last video frame.
+                # Sampling and playback offsets need the video track's duration.
+                stream_duration = st.get("duration")
+                dur_raw = (
+                    stream_duration
+                    if stream_duration not in (None, "", "N/A")
+                    else format_info.get("duration")
+                )
                 width = st.get("width")
                 height = st.get("height")
 
