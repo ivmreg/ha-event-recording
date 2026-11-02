@@ -39,6 +39,7 @@ _MAX_SEGMENTS = 180
 _MAX_AGE_SECONDS = 75.0
 _POLL_INTERVAL = 0.25
 _REQUEST_TIMEOUT = 4.0
+_STALL_TIMEOUT_SECONDS = 10.0
 _SAFE_SESSION_ID = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 
 
@@ -513,7 +514,10 @@ class Go2rtcHlsProducer:
         init_task: asyncio.Task[tuple[bytes, int]] | None = None
 
         async def wait_for_init(init_url: str) -> tuple[bytes, int]:
+            wait_start = time.monotonic()
             while not self._stop.is_set():
+                if time.monotonic() - wait_start > _STALL_TIMEOUT_SECONDS:
+                    raise Go2rtcBufferError("STREAM_CAPTURE_TIMEOUT")
                 init_status, body, reserved = await self._get(
                     init_url, max_bytes=_MAX_INIT_BYTES
                 )
@@ -527,6 +531,7 @@ class Go2rtcHlsProducer:
             raise asyncio.CancelledError
 
         try:
+            last_activity = time.monotonic()
             while not self._stop.is_set():
                 status, raw_playlist, playlist_reserved = await self._get(
                     playlist_url, max_bytes=_MAX_PLAYLIST_BYTES
@@ -553,6 +558,8 @@ class Go2rtcHlsProducer:
                 if relative is None:
                     if available and min(available) > next_seq:
                         raise Go2rtcBufferError("STREAM_SEQUENCE_GAP")
+                    if time.monotonic() - last_activity > _STALL_TIMEOUT_SECONDS:
+                        raise Go2rtcBufferError("STREAM_CAPTURE_TIMEOUT")
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
                 segment_url = self._allowed_url(
@@ -565,6 +572,8 @@ class Go2rtcHlsProducer:
                 )
                 if seg_status == 404:
                     # Empty fragments refresh the session TTL without advancing n.
+                    if time.monotonic() - last_activity > _STALL_TIMEOUT_SECONDS:
+                        raise Go2rtcBufferError("STREAM_CAPTURE_TIMEOUT")
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
                 if seg_status != 200:
@@ -572,6 +581,7 @@ class Go2rtcHlsProducer:
                 if data:
                     pending.append((next_seq, data))
                     pending_bytes += len(data)
+                    last_activity = time.monotonic()
                     if pending_bytes > _MAX_FRAGMENT_BYTES:
                         raise Go2rtcBufferError("BUFFER_FRAGMENT_TOO_LARGE")
                     self.last_hls_sequence = next_seq
